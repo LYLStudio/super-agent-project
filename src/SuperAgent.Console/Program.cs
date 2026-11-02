@@ -78,6 +78,8 @@ var registry = new ToolRegistry();
 registry.Register(new CodeWriterTool());
 registry.Register(new CodeReaderTool());
 registry.Register(new ShellExecTool());
+registry.Register(new DatabaseTool());
+registry.Register(new WebSearchTool());
 
 var agent = new AgentLoop(client, registry);
 
