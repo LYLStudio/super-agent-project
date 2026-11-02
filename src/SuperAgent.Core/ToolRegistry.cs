@@ -222,3 +222,161 @@ public class ShellExecTool : ITool
         }
     }
 }
+
+/// <summary>
+/// FileSearchTool 工具 - 搜尋檔案內容
+/// </summary>
+public class FileSearchTool : ITool
+{
+    public string Name => "file_search";
+    public string Description => "在檔案系統中搜尋檔案內容。支援關鍵字搜尋與路徑篩選。";
+
+    public JsonElement Parameters => JsonSerializer.SerializeToElement(new
+    {
+        type = "object",
+        properties = new
+        {
+            directory = new { type = "string", description = "要搜尋的目錄路徑" },
+            pattern = new { type = "string", description = "搜尋關鍵字或檔案模式" },
+            file_extension = new { type = "string", description = "檔案副檔名（例如 .cs, .txt）" },
+            max_results = new { type = "number", description = "最大回傳結果數，預設 20" }
+        },
+        required = new[] { "directory", "pattern" }
+    });
+
+    public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
+    {
+        string directory = arguments.GetProperty("directory").GetString() ?? Directory.GetCurrentDirectory();
+        string pattern = arguments.GetProperty("pattern").GetString() ?? string.Empty;
+        string fileExtension = arguments.TryGetProperty("file_extension", out var extProp) 
+            ? extProp.GetString() ?? string.Empty 
+            : string.Empty;
+        int maxResults = arguments.TryGetProperty("max_results", out var maxProp) 
+            ? (int)maxProp.GetDouble() 
+            : 20;
+
+        try
+        {
+            if (!Directory.Exists(directory))
+            {
+                return $"Error: Directory not found: {directory}";
+            }
+
+            var searchPattern = string.IsNullOrEmpty(fileExtension) 
+                ? "*" 
+                : $"*{fileExtension}";
+
+            var results = new List<string>();
+            
+            foreach (var file in Directory.GetFiles(directory, searchPattern, SearchOption.AllDirectories))
+            {
+                try
+                {
+                    var content = await File.ReadAllTextAsync(file, cancellationToken);
+                    if (content.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var lineNumber = content.Split('\n').ToList()
+                            .FindIndex(l => l.Contains(pattern, StringComparison.OrdinalIgnoreCase)) + 1;
+                        
+                        results.Add($"[{file}:{lineNumber}] {content.Split('\n')[Math.Max(0, lineNumber - 1)].Trim()}");
+                        
+                        if (results.Count >= maxResults)
+                        {
+                            break;
+                        }
+                    }
+                }
+                catch
+                {
+                    // 跳過無法讀取的檔案
+                }
+            }
+
+            if (results.Count == 0)
+            {
+                return $"No files found matching pattern '{pattern}' in '{directory}'";
+            }
+
+            return $"Found {results.Count} result(s):\n{string.Join("\n", results)}";
+        }
+        catch (Exception ex)
+        {
+            return $"Error searching files: {ex.Message}";
+        }
+    }
+}
+
+/// <summary>
+/// GitTool 工具 - Git 版本控制操作
+/// </summary>
+public class GitTool : ITool
+{
+    public string Name => "git_tool";
+    public string Description => "執行 Git 版本控制命令。";
+
+    public JsonElement Parameters => JsonSerializer.SerializeToElement(new
+    {
+        type = "object",
+        properties = new
+        {
+            command = new { type = "string", description = "Git 命令（例如 status, log, diff, add, commit）" },
+            args = new { type = "string", description = "額外參數" },
+            timeout_seconds = new { type = "number", description = "超時秒數，預設 30" }
+        },
+        required = new[] { "command" }
+    });
+
+    public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
+    {
+        string command = arguments.GetProperty("command").GetString() ?? string.Empty;
+        string args = arguments.TryGetProperty("args", out var argsProp) 
+            ? argsProp.GetString() ?? string.Empty 
+            : string.Empty;
+        int timeout = arguments.TryGetProperty("timeout_seconds", out var timeoutProp) 
+            ? (int)timeoutProp.GetDouble() 
+            : 30;
+
+        try
+        {
+            var fullCommand = $"git {command} {args}".Trim();
+            
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = fullCommand,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            System.Diagnostics.Process? process = System.Diagnostics.Process.Start(startInfo);
+            if (process is null)
+            {
+                return "Error: Unable to start git process";
+            }
+
+            await process.WaitForExitAsync(cancellationToken);
+
+            var output = await process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var error = await process.StandardError.ReadToEndAsync(cancellationToken);
+
+            var result = new System.Text.StringBuilder();
+            if (!string.IsNullOrEmpty(output))
+            {
+                result.AppendLine($"STDOUT:\n{output}");
+            }
+            if (!string.IsNullOrEmpty(error))
+            {
+                result.AppendLine($"STDERR:\n{error}");
+            }
+            result.AppendLine($"Exit code: {process.ExitCode}");
+
+            return result.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"Error executing git command: {ex.Message}";
+        }
+    }
+}

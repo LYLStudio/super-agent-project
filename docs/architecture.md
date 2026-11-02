@@ -86,3 +86,4 @@ SuperAgent 是一個原生 .NET 10 AI Agent CLI，採用 OpenAI 相容 API 規�
 - ShellExecTool 執行任意 shell 命令存在安全風險
 - 建議在生產環境中限制 ShellExecTool 使用權
 - API 密鑰應透過環境變數設定，不應硬編碼
+- System.Text.Json 已升級至 9.0.0 修復安全性漏洞

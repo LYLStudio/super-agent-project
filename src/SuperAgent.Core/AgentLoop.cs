@@ -1,5 +1,8 @@
+using System;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace SuperAgent.Core;
 
@@ -72,13 +75,33 @@ public class AgentLoop
     private readonly IAgentClient _client;
     private readonly IToolRegistry _toolRegistry;
     private readonly AgentLoopConfig _config;
+    private readonly RetryPolicy _retryPolicy;
+    private readonly ConversationStorage? _conversationStorage;
+    private readonly string? _conversationId;
     private readonly List<AgentMessage> _messages = new();
 
+    /// <summary>
+    /// 建立 Agent Loop
+    /// </summary>
     public AgentLoop(IAgentClient client, IToolRegistry toolRegistry, AgentLoopConfig? config = null)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _toolRegistry = toolRegistry ?? throw new ArgumentNullException(nameof(toolRegistry));
         _config = config ?? new AgentLoopConfig();
+        _retryPolicy = new RetryPolicy(maxRetries: 3, initialDelay: TimeSpan.FromSeconds(1), maxDelay: TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>
+    /// 建立支援會話儲存的 Agent Loop
+    /// </summary>
+    public AgentLoop(IAgentClient client, IToolRegistry toolRegistry, ConversationStorage conversationStorage, string conversationId, AgentLoopConfig? config = null)
+    {
+        _client = client ?? throw new ArgumentNullException(nameof(client));
+        _toolRegistry = toolRegistry ?? throw new ArgumentNullException(nameof(toolRegistry));
+        _config = config ?? new AgentLoopConfig();
+        _retryPolicy = new RetryPolicy(maxRetries: 3, initialDelay: TimeSpan.FromSeconds(1), maxDelay: TimeSpan.FromSeconds(30));
+        _conversationStorage = conversationStorage;
+        _conversationId = conversationId;
     }
 
     /// <summary>
@@ -86,12 +109,33 @@ public class AgentLoop
     /// </summary>
     public async Task<AgentLoopResult> RunAsync(string userInput, CancellationToken cancellationToken = default)
     {
-        // 初始化系統訊息
-        _messages.Add(new AgentMessage
+        // 載入歷史會話 (如果支援會話儲存)
+        if (_conversationStorage is not null && _conversationId is not null)
         {
-            Role = "system",
-            Content = GetSystemPrompt()
-        });
+            var historicalMessages = await _conversationStorage.LoadConversationAsync(_conversationId, cancellationToken);
+            if (historicalMessages != null && historicalMessages.Count > 0)
+            {
+                _messages.AddRange(historicalMessages);
+            }
+            else
+            {
+                // 初始化系統訊息
+                _messages.Add(new AgentMessage
+                {
+                    Role = "system",
+                    Content = GetSystemPrompt()
+                });
+            }
+        }
+        else
+        {
+            // 初始化系統訊息
+            _messages.Add(new AgentMessage
+            {
+                Role = "system",
+                Content = GetSystemPrompt()
+            });
+        }
 
         // 加入使用者輸入
         _messages.Add(new AgentMessage
@@ -108,9 +152,12 @@ public class AgentLoop
             iteration++;
             state = AgentLoopState.Thinking;
 
-            // 步驟 1: 思考 - 分析當前狀態與任務
-            var thoughtResponse = await GenerateResponseAsync(cancellationToken);
-            
+            // 步驟 1: 思考 - 分析當前狀態與任務 (支援重試)
+            var thoughtResponse = await _retryPolicy.ExecuteAsync(
+                async (ct) => await GenerateResponseAsync(ct),
+                "GenerateResponse",
+                cancellationToken);
+
             if (thoughtResponse.ToolCalls.Count > 0 && _config.EnableToolChoice)
             {
                 // 步驟 2: 規劃 - 決定哪些工具需要執行
@@ -146,6 +193,19 @@ public class AgentLoop
         if (state != AgentLoopState.Completed)
         {
             state = AgentLoopState.Failed;
+        }
+
+        // 儲存會話 (如果支援會話儲存)
+        if (_conversationStorage is not null && _conversationId is not null)
+        {
+            try
+            {
+                await _conversationStorage.SaveConversationAsync(_conversationId, _messages, cancellationToken);
+            }
+            catch
+            {
+                // 會話儲存失敗不應中斷主流程
+            }
         }
 
         return new AgentLoopResult
