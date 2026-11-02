@@ -79,6 +79,7 @@ public class AgentLoop
     private readonly ConversationStorage? _conversationStorage;
     private readonly string? _conversationId;
     private readonly List<AgentMessage> _messages = new();
+    private readonly PerformanceMonitor _performanceMonitor = new();
 
     /// <summary>
     /// 建立 Agent Loop
