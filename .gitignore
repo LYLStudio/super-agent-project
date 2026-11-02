@@ -1,0 +1,28 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.vs
+*.orig
+_PublishOutput/
+.publish/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+*.code-workspace-*
+
+# Testing
+*.testresults/
+**/TestResults.xml
+
+# Logs
+*.log
+logs/
