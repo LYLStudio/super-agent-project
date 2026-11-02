@@ -153,10 +153,43 @@ public class AgentLoop
             state = AgentLoopState.Thinking;
 
             // 步驟 1: 思考 - 分析當前狀態與任務 (支援重試)
-            var thoughtResponse = await _retryPolicy.ExecuteAsync(
-                async (ct) => await GenerateResponseAsync(ct),
-                "GenerateResponse",
-                cancellationToken);
+            AgentMessage? thoughtResponse = null;
+            try
+            {
+                var response = await _retryPolicy.ExecuteAsync(
+                    async (ct) => await GenerateResponseAsync(ct),
+                    "GenerateResponse",
+                    cancellationToken);
+                thoughtResponse = new AgentMessage
+                {
+                    Role = "assistant",
+                    Content = response.Content ?? string.Empty,
+                    ToolCalls = response.ToolCalls.Select(tc => new ToolCall
+                    {
+                        Id = tc.Id,
+                        Name = tc.Name,
+                        Arguments = tc.Arguments
+                    }).ToList()
+                };
+            }
+            catch
+            {
+                // 重試失敗後，建立錯誤回應訊息
+                thoughtResponse = new AgentMessage
+                {
+                    Role = "assistant",
+                    Content = $"錯誤: API 請求失敗後重試 {_config.MaxIterations} 次後仍然失敗。請檢查 API 端點與密鑰設定。",
+                    ToolCalls = new List<ToolCall>()
+                };
+            }
+
+            // 檢查是否為錯誤回應
+            if (thoughtResponse is not null && thoughtResponse.Content.StartsWith("錯誤:"))
+            {
+                state = AgentLoopState.Failed;
+                _messages.Add(thoughtResponse);
+                break;
+            }
 
             if (thoughtResponse.ToolCalls.Count > 0 && _config.EnableToolChoice)
             {
