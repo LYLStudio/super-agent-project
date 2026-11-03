@@ -31,10 +31,10 @@ SuperAgent AI Agent CLI - 產品 Backlog
 ### EPIC-005: 程式開發能力
 - US-019: 實作程式碼分析與除錯工具 (Sprint 8 - 完成)
 - US-020: 實作專案建置與測試自動化 (Sprint 8 - 完成)
-- US-021: 實作程式碼重構建議 (Sprint 9)
+- US-021: 實作程式碼重構建議 (Sprint 9 - 完成)
 
 ### EPIC-006: 部署與維護
-- US-022: 實作 Docker 容器化 (Sprint 9)
+- US-022: 實作 Docker 容器化 (Sprint 9 - 完成)
 - US-023: 實作 CI/CD 流程 (Sprint 10)
 - US-024: 實作效能監控與日誌 (Sprint 5 - 完成)
 
@@ -65,8 +65,8 @@ SuperAgent AI Agent CLI - 產品 Backlog
 - US-012: 增加網頁爬蟲工具 (完成 - Sprint 4)
 - US-019: 實作程式碼分析與除錯工具 (完成 - Sprint 8)
 - US-020: 實作專案建置與測試自動化 (完成 - Sprint 8)
-- US-021: 實作程式碼重構建議 (Sprint 9)
-- US-022: 實作 Docker 容器化 (Sprint 9)
+- US-021: 實作程式碼重構建議 (完成 - Sprint 9)
+- US-022: 實作 Docker 容器化 (完成 - Sprint 9)
 - US-023: 實作 CI/CD 流程 (Sprint 10)
 - US-024: 實作效能監控與日誌 (完成 - Sprint 5)
 
@@ -74,5 +74,5 @@ SuperAgent AI Agent CLI - 產品 Backlog
 - Agent Loop 錯誤恢復機制
 - 工具插件系統
 - 安全性加固 (API 密鑰加密 - 已於 Sprint 7 完成)
-- 單元測試覆蓋率提升 (已於 Sprint 7-8 新增測試)
+- 單元測試覆蓋率提升 (已於 Sprint 7-9 新增測試)
 

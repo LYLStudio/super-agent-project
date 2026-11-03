@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  superagent:
+    build: .
+    container_name: superagent
+    environment:
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://host.docker.internal:8080}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-qwen3-coder:30b}
+      - SUPERAGENT_ENCRYPTION_KEY=${SUPERAGENT_ENCRYPTION_KEY}
+      - SUPERAGENT_API_KEY=${SUPERAGENT_API_KEY}
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - api-server
+
+  api-server:
+    image: localhost:5000/api-server:latest
+    container_name: api-server
+    environment:
+      - MODEL_NAME=${MODEL_NAME:-qwen3-coder:30b}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  logs:

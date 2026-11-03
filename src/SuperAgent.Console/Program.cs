@@ -111,6 +111,9 @@ registry.Register(new CodeAnalysisTool());
 registry.Register(new TestGeneratorTool());
 registry.Register(new DebuggerTool());
 
+// Sprint 9: 新增程式碼重構建議工具
+registry.Register(new RefactoringTool());
+
 var agent = new AgentLoop(client, registry);
 
 while (true)
