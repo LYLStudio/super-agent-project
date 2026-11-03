@@ -8,7 +8,46 @@ var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "dummy";
 var baseUrl = Environment.GetEnvironmentVariable("OPENAI_BASE_URL") ?? "http://localhost:8080";
 var configPath = Environment.GetEnvironmentVariable("SUPERAGENT_CONFIG") ?? "appsettings.json";
 
-// 解析命令列參數
+// 新增：API 密鑰管理與多模型支援 (Sprint 7)
+var apiKeyManager = new ApiKeyManager(Environment.GetEnvironmentVariable("SUPERAGENT_ENCRYPTION_KEY") ?? "default-encryption-key-0000000000000000");
+var modelSelector = new ModelSelector();
+
+// 從環境變數載入 API 密鑰
+var envApiKey = Environment.GetEnvironmentVariable("SUPERAGENT_API_KEY");
+if (!string.IsNullOrWhiteSpace(envApiKey))
+{
+    apiKeyManager.AddKey("env-key", envApiKey, "SUPERAGENT_API_KEY");
+}
+
+// 從命令列參數載入 API 密鑰
+foreach (var arg in args)
+{
+    if (arg.StartsWith("--api-key=", StringComparison.OrdinalIgnoreCase))
+    {
+        var keyValue = arg.Substring(arg.IndexOf('=') + 1);
+        apiKeyManager.AddKey("cmd-key", keyValue);
+    }
+}
+
+// 從設定檔載入 API 密鑰
+var configuration = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile(configPath, optional: true, reloadOnChange: true)
+    .AddEnvironmentVariables()
+    .Build();
+
+if (configuration["App:ApiKey"] is string configKey && !string.IsNullOrWhiteSpace(configKey))
+{
+    apiKeyManager.AddKey("config-key", configKey);
+}
+
+// 設定模型
+if (configuration["App:Model"] is string configModel)
+{
+    model = configModel;
+}
+
+// 解析命令列參數 (模型)
 foreach (var arg in args)
 {
     if (arg.StartsWith("--model=", StringComparison.OrdinalIgnoreCase))
@@ -17,7 +56,7 @@ foreach (var arg in args)
     }
     else if (arg.StartsWith("--api-key=", StringComparison.OrdinalIgnoreCase))
     {
-        apiKey = arg.Substring(arg.IndexOf('=') + 1);
+        // 已在上面處理
     }
     else if (arg.StartsWith("--config=", StringComparison.OrdinalIgnoreCase))
     {
@@ -44,34 +83,20 @@ foreach (var arg in args)
     }
 }
 
-// 載入設定檔 (如果有)
-var configuration = new ConfigurationBuilder()
-    .SetBasePath(AppContext.BaseDirectory)
-    .AddJsonFile(configPath, optional: true, reloadOnChange: true)
-    .AddEnvironmentVariables()
-    .Build();
-
-if (configuration["App:Model"] is string m)
-{
-    model = m;
-}
-
-if (configuration["App:ApiKey"] is string key)
-{
-    apiKey = key;
-}
-
-if (configuration["App:BaseUrl"] is string url)
-{
-    baseUrl = url;
-}
-
+// 顯示 API 密鑰狀態
 AnsiConsole.MarkupLine("[bold]SuperAgent AI Agent CLI[/]");
 AnsiConsole.MarkupLine($"[bold]Model:[/] {model}");
 AnsiConsole.MarkupLine($"[bold]Endpoint:[/] {baseUrl}");
+AnsiConsole.MarkupLine($"[bold]API 密鑰數量:[/] {apiKeyManager.KeyCount} (活用: {apiKeyManager.ActiveKeyCount})");
 AnsiConsole.MarkupLine("");
 
-var client = OpenAICompatClientFactory.Create(baseUrl, apiKey, model);
+// 建立支援密鑰輪替的客戶端
+var client = OpenAICompatClientFactory.CreateWithKeyRotation(
+    baseUrl,
+    apiKeyManager,
+    modelSelector,
+    model);
+
 var registry = new ToolRegistry();
 
 // 註冊預設工具
