@@ -106,6 +106,11 @@ registry.Register(new ShellExecTool());
 registry.Register(new DatabaseTool());
 registry.Register(new WebSearchTool());
 
+// Sprint 8: 新增程式碼分析與除錯工具
+registry.Register(new CodeAnalysisTool());
+registry.Register(new TestGeneratorTool());
+registry.Register(new DebuggerTool());
+
 var agent = new AgentLoop(client, registry);
 
 while (true)
