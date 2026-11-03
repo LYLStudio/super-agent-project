@@ -114,6 +114,10 @@ registry.Register(new DebuggerTool());
 // Sprint 9: 新增程式碼重構建議工具
 registry.Register(new RefactoringTool());
 
+// Sprint 10: 效能監控與日誌工具
+registry.Register(new PerformanceMonitor());
+registry.Register(new LoggingTool());
+
 var agent = new AgentLoop(client, registry);
 
 while (true)

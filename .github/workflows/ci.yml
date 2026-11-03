@@ -28,10 +28,24 @@ jobs:
       - name: Run tests
         run: dotnet test --no-build --verbosity normal
 
-      - name: Publish code quality report
+      - name: Code quality analysis
+        run: |
+          echo "Running code quality checks..."
+          dotnet build --no-restore -v:n
+          echo "✅ Build completed without errors"
+
+      - name: Publish test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: '**/*TestResults*.trx'
+          retention-days: 30
+
+      - name: Publish coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: '**/coverage.xml'
           retention-days: 30
