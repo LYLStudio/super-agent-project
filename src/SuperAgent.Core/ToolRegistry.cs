@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -142,7 +143,7 @@ public class CodeReaderTool : ITool
             }
 
             var content = await File.ReadAllTextAsync(filePath, cancellationToken);
-            return content;
+            return $"File content ({content.Length} bytes):\n{content}";
         }
         catch (Exception ex)
         {
@@ -173,8 +174,8 @@ public class ShellExecTool : ITool
     public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
     {
         string command = arguments.GetProperty("command").GetString() ?? string.Empty;
-        int timeout = arguments.TryGetProperty("timeout_seconds", out var timeoutProp) 
-            ? (int)timeoutProp.GetDouble() 
+        int timeout = arguments.TryGetProperty("timeout_seconds", out var timeoutProp)
+            ? (int)timeoutProp.GetDouble()
             : 30;
 
         try
@@ -248,11 +249,11 @@ public class FileSearchTool : ITool
     {
         string directory = arguments.GetProperty("directory").GetString() ?? Directory.GetCurrentDirectory();
         string pattern = arguments.GetProperty("pattern").GetString() ?? string.Empty;
-        string fileExtension = arguments.TryGetProperty("file_extension", out var extProp) 
-            ? extProp.GetString() ?? string.Empty 
+        string fileExtension = arguments.TryGetProperty("file_extension", out var extProp)
+            ? extProp.GetString() ?? string.Empty
             : string.Empty;
-        int maxResults = arguments.TryGetProperty("max_results", out var maxProp) 
-            ? (int)maxProp.GetDouble() 
+        int maxResults = arguments.TryGetProperty("max_results", out var maxProp)
+            ? (int)maxProp.GetDouble()
             : 20;
 
         try
@@ -262,24 +263,17 @@ public class FileSearchTool : ITool
                 return $"Error: Directory not found: {directory}";
             }
 
-            var searchPattern = string.IsNullOrEmpty(fileExtension) 
-                ? "*" 
-                : $"*{fileExtension}";
-
+            var files = Directory.GetFiles(directory, "*" + fileExtension, SearchOption.AllDirectories);
             var results = new List<string>();
-            
-            foreach (var file in Directory.GetFiles(directory, searchPattern, SearchOption.AllDirectories))
+
+            foreach (var file in files)
             {
                 try
                 {
                     var content = await File.ReadAllTextAsync(file, cancellationToken);
                     if (content.Contains(pattern, StringComparison.OrdinalIgnoreCase))
                     {
-                        var lineNumber = content.Split('\n').ToList()
-                            .FindIndex(l => l.Contains(pattern, StringComparison.OrdinalIgnoreCase)) + 1;
-                        
-                        results.Add($"[{file}:{lineNumber}] {content.Split('\n')[Math.Max(0, lineNumber - 1)].Trim()}");
-                        
+                        results.Add(file);
                         if (results.Count >= maxResults)
                         {
                             break;
@@ -288,16 +282,21 @@ public class FileSearchTool : ITool
                 }
                 catch
                 {
-                    // 跳過無法讀取的檔案
+                    // 忽略無法讀取的文件
                 }
             }
 
-            if (results.Count == 0)
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"搜尋結果: {pattern}");
+            sb.AppendLine($"找到 {results.Count} 個文件:");
+            sb.AppendLine();
+
+            foreach (var file in results)
             {
-                return $"No files found matching pattern '{pattern}' in '{directory}'";
+                sb.AppendLine($"  - {file}");
             }
 
-            return $"Found {results.Count} result(s):\n{string.Join("\n", results)}";
+            return sb.ToString();
         }
         catch (Exception ex)
         {
@@ -307,21 +306,20 @@ public class FileSearchTool : ITool
 }
 
 /// <summary>
-/// GitTool 工具 - Git 版本控制操作
+/// GitTool 工具 - Git 版本控制工具
 /// </summary>
 public class GitTool : ITool
 {
     public string Name => "git_tool";
-    public string Description => "執行 Git 版本控制命令。";
+    public string Description => "執行 Git 版本控制命令。支援常見的 Git 操作。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
         type = "object",
         properties = new
         {
-            command = new { type = "string", description = "Git 命令（例如 status, log, diff, add, commit）" },
-            args = new { type = "string", description = "額外參數" },
-            timeout_seconds = new { type = "number", description = "超時秒數，預設 30" }
+            command = new { type = "string", description = "Git 命令 (例如 status, log, diff)" },
+            args = new { type = "string", description = "額外參數" }
         },
         required = new[] { "command" }
     });
@@ -329,17 +327,17 @@ public class GitTool : ITool
     public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
     {
         string command = arguments.GetProperty("command").GetString() ?? string.Empty;
-        string args = arguments.TryGetProperty("args", out var argsProp) 
-            ? argsProp.GetString() ?? string.Empty 
+        string args = arguments.TryGetProperty("args", out var argsProp)
+            ? argsProp.GetString() ?? string.Empty
             : string.Empty;
-        int timeout = arguments.TryGetProperty("timeout_seconds", out var timeoutProp) 
-            ? (int)timeoutProp.GetDouble() 
-            : 30;
+
+        if (string.IsNullOrWhiteSpace(command))
+            return "Error: Git 命令不能為空";
 
         try
         {
             var fullCommand = $"git {command} {args}".Trim();
-            
+
             var startInfo = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "git",
@@ -380,6 +378,7 @@ public class GitTool : ITool
         }
     }
 }
+
 /// <summary>
 /// WebSearchTool - 網頁搜尋工具，支援搜尋引擎與頁面內容擷取
 /// </summary>
@@ -418,7 +417,6 @@ public class WebSearchTool : ITool
 
         try
         {
-            // 模擬搜尋結果 (實際實作應呼叫搜尋 API)
             var results = new List<string>
             {
                 $"搜尋 '{query}' 的相關資訊 (模擬結果)",
@@ -447,5 +445,477 @@ public class WebSearchTool : ITool
         {
             return $"Error executing web search: {ex.Message}";
         }
+    }
+}
+
+/// <summary>
+/// CodeAnalysisTool - 程式碼分析工具，分析程式碼品質與潛在問題
+/// </summary>
+public class CodeAnalysisTool : ITool
+{
+    public string Name => "code_analysis";
+
+    public string Description => "分析程式碼品質與潛在問題。支援檢查語法錯誤、命名規範、複雜度與安全性問題。";
+
+    public JsonElement Parameters => JsonSerializer.SerializeToElement(new
+    {
+        type = "object",
+        properties = new
+        {
+            file_path = new { type = "string", description = "要分析的程式碼文件路徑" },
+            analysis_type = new { type = "string", description = "分析類型 (syntax, style, complexity, security, all)" }
+        },
+        required = new[] { "file_path" }
+    });
+
+    public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
+    {
+        string filePath = arguments.GetProperty("file_path").GetString() ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return "Error: 文件路徑不能為空";
+        }
+
+        if (!File.Exists(filePath))
+        {
+            return $"Error: 文件 '{filePath}' 不存在";
+        }
+
+        try
+        {
+            var content = await File.ReadAllTextAsync(filePath, cancellationToken);
+            var sb = new System.Text.StringBuilder();
+
+            sb.AppendLine($"程式碼分析報告: {filePath}");
+            sb.AppendLine();
+
+            var styleIssues = CheckStyle(content);
+            if (styleIssues.Any())
+            {
+                sb.AppendLine("=== 風格檢查 ===");
+                foreach (var issue in styleIssues)
+                {
+                    sb.AppendLine($"  [建議] {issue}");
+                }
+            }
+            else
+            {
+                sb.AppendLine("  程式碼風格良好");
+            }
+
+            var complexityIssues = CheckComplexity(content);
+            if (complexityIssues.Any())
+            {
+                sb.AppendLine();
+                sb.AppendLine("=== 複雜度檢查 ===");
+                foreach (var issue in complexityIssues)
+                {
+                    sb.AppendLine($"  [資訊] {issue}");
+                }
+            }
+
+            var securityIssues = CheckSecurity(content);
+            if (securityIssues.Any())
+            {
+                sb.AppendLine();
+                sb.AppendLine("=== 安全性檢查 ===");
+                foreach (var issue in securityIssues)
+                {
+                    sb.AppendLine($"  [安全] {issue}");
+                }
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("分析完成");
+
+            return sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"Error analyzing file: {ex.Message}";
+        }
+    }
+
+    private List<string> CheckStyle(string content)
+    {
+        var issues = new List<string>();
+        var lines = content.Split('\n');
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            var lineNum = i + 1;
+
+            if (line.Length > 120)
+            {
+                issues.Add($"第 {lineNum} 行過長 ({line.Length} 字符)，建議拆分");
+            }
+
+            if (line.EndsWith(" ") || line.EndsWith("\t"))
+            {
+                issues.Add($"第 {lineNum} 行有尾隨空格");
+            }
+        }
+
+        return issues;
+    }
+
+    private List<string> CheckComplexity(string content)
+    {
+        var issues = new List<string>();
+
+        var ifCount = Regex.Matches(content, @"\bif\b").Count;
+        if (ifCount > 5)
+        {
+            issues.Add($"if/else 數量較多 ({ifCount} 個 if)，建議考慮重構");
+        }
+
+        var methodCount = Regex.Matches(content, @"\b(?:public|private|protected|internal)\s+[\w<>]+\s+\w+\s*\(").Count;
+        if (methodCount > 10)
+        {
+            issues.Add($"方法數量較多 ({methodCount} 個)，建議考慮拆分類別");
+        }
+
+        return issues;
+    }
+
+    private List<string> CheckSecurity(string content)
+    {
+        var issues = new List<string>();
+
+        if (content.Contains("apiKey") || content.Contains("API_KEY") || content.Contains("password"))
+        {
+            issues.Add("發現可能硬編碼的敏感資訊，建議使用環境變數");
+        }
+
+        if (content.Contains("Process.Start") || content.Contains("shell_exec"))
+        {
+            issues.Add("發現進程執行相關程式碼，請確保輸入驗證充分");
+        }
+
+        return issues;
+    }
+}
+
+/// <summary>
+/// TestGeneratorTool - 自動產生單元測試工具
+/// </summary>
+public class TestGeneratorTool : ITool
+{
+    public string Name => "test_generator";
+
+    public string Description => "自動產生單元測試。支援為現有程式碼產生 xunit 測試案例。";
+
+    public JsonElement Parameters => JsonSerializer.SerializeToElement(new
+    {
+        type = "object",
+        properties = new
+        {
+            file_path = new { type = "string", description = "要產生測試的程式碼文件路徑" },
+            test_framework = new { type = "string", description = "測試框架 (xunit, nunit, mstest)" },
+            target_class = new { type = "string", description = "目標類別名稱 (可選)" }
+        },
+        required = new[] { "file_path" }
+    });
+
+    public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
+    {
+        string filePath = arguments.GetProperty("file_path").GetString() ?? string.Empty;
+        string testFramework = arguments.TryGetProperty("test_framework", out var fwProp)
+            ? fwProp.GetString() ?? "xunit"
+            : "xunit";
+        string targetClass = arguments.TryGetProperty("target_class", out var tcProp)
+            ? tcProp.GetString() ?? string.Empty
+            : string.Empty;
+
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return "Error: 文件路徑不能為空";
+        }
+
+        if (!File.Exists(filePath))
+        {
+            return $"Error: 文件 '{filePath}' 不存在";
+        }
+
+        try
+        {
+            var content = await File.ReadAllTextAsync(filePath, cancellationToken);
+            var sb = new System.Text.StringBuilder();
+
+            var className = Path.GetFileNameWithoutExtension(filePath);
+            if (!string.IsNullOrEmpty(targetClass))
+            {
+                className = targetClass;
+            }
+
+            var testFilePath = filePath.Replace(".cs", ".Tests.cs");
+            var testNamespace = "SuperAgent.Core.Tests";
+
+            sb.AppendLine("// 自動產生的單元測試");
+            sb.AppendLine("// 來源: " + filePath);
+            sb.AppendLine();
+            sb.AppendLine("using Xunit;");
+            sb.AppendLine("using SuperAgent.Core;");
+            sb.AppendLine();
+            sb.AppendLine($"namespace {testNamespace};");
+            sb.AppendLine();
+            sb.AppendLine($"public class {className}Tests");
+            sb.AppendLine("{");
+            sb.AppendLine();
+
+            var methods = ExtractPublicMethods(content);
+            foreach (var method in methods)
+            {
+                sb.AppendLine($"    [Fact]");
+                sb.AppendLine($"    public void {method.Name}_Test_Success()");
+                sb.AppendLine($"    {{");
+                sb.AppendLine($"        // Arrange");
+                sb.AppendLine($"        var {className} = new {className}();");
+                sb.AppendLine();
+                sb.AppendLine($"        // Act");
+                sb.AppendLine($"        var result = {className}.{method.Name}();");
+                sb.AppendLine();
+                sb.AppendLine($"        // Assert");
+                sb.AppendLine($"        Assert.NotNull(result);");
+                sb.AppendLine($"    }}");
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("}");
+
+            var directory = Path.GetDirectoryName(testFilePath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            await File.WriteAllTextAsync(testFilePath, sb.ToString(), cancellationToken);
+
+            return $"Successfully generated test file: {testFilePath} ({sb.Length} bytes)";
+        }
+        catch (Exception ex)
+        {
+            return $"Error generating tests: {ex.Message}";
+        }
+    }
+
+    private List<MethodInfo> ExtractPublicMethods(string content)
+    {
+        var methods = new List<MethodInfo>();
+        var pattern = @"\bpublic\s+(?:[\w<>\[\]]+\s+)?(\w+)\s*\(([^)]*)\)";
+        var matches = Regex.Matches(content, pattern);
+        foreach (Match match in matches)
+        {
+            methods.Add(new MethodInfo
+            {
+                Name = match.Groups[1].Value,
+                Parameters = match.Groups[2].Value
+            });
+        }
+        return methods;
+    }
+
+    private class MethodInfo
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Parameters { get; set; } = string.Empty;
+    }
+}
+
+/// <summary>
+/// DebuggerTool - 除錯工具，協助除錯與錯誤修復
+/// </summary>
+public class DebuggerTool : ITool
+{
+    public string Name => "debugger";
+
+    public string Description => "協助除錯與錯誤修復。支援錯誤分析、程式碼修復建議與除錯策略。";
+
+    public JsonElement Parameters => JsonSerializer.SerializeToElement(new
+    {
+        type = "object",
+        properties = new
+        {
+            error_message = new { type = "string", description = "錯誤訊息" },
+            file_path = new { type = "string", description = "相關文件路徑 (可選)" },
+            debug_level = new { type = "string", description = "除錯等級 (basic, detailed, full)" }
+        },
+        required = new[] { "error_message" }
+    });
+
+    public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
+    {
+        string errorMessage = arguments.GetProperty("error_message").GetString() ?? string.Empty;
+        string filePath = arguments.TryGetProperty("file_path", out var fpProp)
+            ? fpProp.GetString() ?? string.Empty
+            : string.Empty;
+        string debugLevel = arguments.TryGetProperty("debug_level", out var dlProp)
+            ? dlProp.GetString() ?? "basic"
+            : "basic";
+
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            return "Error: 錯誤訊息不能為空";
+        }
+
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+
+            sb.AppendLine($"除錯分析報告");
+            sb.AppendLine($"錯誤訊息: {errorMessage}");
+            sb.AppendLine();
+
+            var errorType = ClassifyError(errorMessage);
+            sb.AppendLine($"錯誤類型: {errorType}");
+            sb.AppendLine();
+
+            sb.AppendLine("=== 除錯建議 ===");
+            var suggestions = GetDebugSuggestions(errorMessage, filePath, debugLevel);
+            foreach (var suggestion in suggestions)
+            {
+                sb.AppendLine($"  - {suggestion}");
+            }
+            sb.AppendLine();
+
+            if (!string.IsNullOrWhiteSpace(filePath) && File.Exists(filePath))
+            {
+                sb.AppendLine("=== 文件分析 ===");
+                var content = await File.ReadAllTextAsync(filePath, cancellationToken);
+                var fileSuggestions = AnalyzeFileForErrors(content, errorMessage);
+                foreach (var suggestion in fileSuggestions)
+                {
+                    sb.AppendLine($"  - {suggestion}");
+                }
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("除錯分析完成");
+
+            return sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            return $"Error during debugging: {ex.Message}";
+        }
+    }
+
+    private string ClassifyError(string errorMessage)
+    {
+        var lower = errorMessage.ToLowerInvariant();
+
+        if (lower.Contains("nullreference") || lower.Contains("null reference"))
+        {
+            return "NullReferenceException - 空值參照錯誤";
+        }
+        if (lower.Contains("indexoutofrange") || lower.Contains("index out of range"))
+        {
+            return "IndexOutOfRangeException - 索引超出範圍錯誤";
+        }
+        if (lower.Contains("filenotfound") || lower.Contains("file not found"))
+        {
+            return "FileNotFoundException - 文件未找到錯誤";
+        }
+        if (lower.Contains("argumentexception") || lower.Contains("argument exception"))
+        {
+            return "ArgumentException - 引數錯誤";
+        }
+        if (lower.Contains("httprequest") || lower.Contains("http request"))
+        {
+            return "HttpRequestException - HTTP 請求錯誤";
+        }
+        if (lower.Contains("json") && lower.Contains("parse"))
+        {
+            return "JsonException - JSON 解析錯誤";
+        }
+        if (lower.Contains("timeout"))
+        {
+            return "TimeoutException - 超時錯誤";
+        }
+
+        return "UnknownError - 未知錯誤";
+    }
+
+    private List<string> GetDebugSuggestions(string errorMessage, string filePath, string debugLevel)
+    {
+        var suggestions = new List<string>();
+
+        var lower = errorMessage.ToLowerInvariant();
+
+        if (lower.Contains("nullreference"))
+        {
+            suggestions.Add("檢查變數是否為 null，使用 null 檢查或 null 合併運算子");
+            suggestions.Add("在使用物件屬性前加入 null 檢查");
+        }
+
+        if (lower.Contains("indexoutofrange"))
+        {
+            suggestions.Add("檢查索引是否在陣列/列表範圍內");
+            suggestions.Add("使用 FirstOrDefault() 或 TryGetValue() 避免拋出例外");
+        }
+
+        if (lower.Contains("filenotfound"))
+        {
+            suggestions.Add("確認文件路徑是否正確");
+            suggestions.Add("檢查文件是否存在與權限是否足夠");
+        }
+
+        if (lower.Contains("httprequest"))
+        {
+            suggestions.Add("檢查網路連線與 API 端點是否正確");
+            suggestions.Add("檢查 API 密鑰與認證資訊");
+        }
+
+        if (lower.Contains("json") && lower.Contains("parse"))
+        {
+            suggestions.Add("檢查 JSON 格式是否正確");
+            suggestions.Add("使用 JsonDocument.TryParseElement() 安全解析");
+        }
+
+        if (lower.Contains("timeout"))
+        {
+            suggestions.Add("增加超時設定");
+            suggestions.Add("檢查網路連線是否穩定");
+        }
+
+        if (suggestions.Count == 0)
+        {
+            suggestions.Add("請檢查錯誤堆疊追蹤以找出錯誤發生位置");
+            suggestions.Add("加入日誌記錄以追蹤變數值");
+        }
+
+        if (debugLevel.Equals("detailed", StringComparison.OrdinalIgnoreCase) ||
+            debugLevel.Equals("full", StringComparison.OrdinalIgnoreCase))
+        {
+            suggestions.Add("考慮加入更詳細的日誌記錄");
+            suggestions.Add("使用斷點除錯逐步執行程式碼");
+            suggestions.Add("檢查相關的單元測試是否通過");
+        }
+
+        return suggestions;
+    }
+
+    private List<string> AnalyzeFileForErrors(string content, string errorMessage)
+    {
+        var suggestions = new List<string>();
+
+        if (content.Contains(".") && errorMessage.Contains("NullReference"))
+        {
+            suggestions.Add("檢查此處是否有可能為 null 的物件引用");
+        }
+
+        if (content.Contains("["))
+        {
+            suggestions.Add("檢查陣列索引是否在範圍內");
+        }
+
+        if (content.Contains("File.Read") || content.Contains("File.Write"))
+        {
+            suggestions.Add("檢查文件操作是否有適當的錯誤處理");
+        }
+
+        return suggestions;
     }
 }
