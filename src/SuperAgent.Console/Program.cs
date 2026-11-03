@@ -118,6 +118,10 @@ registry.Register(new RefactoringTool());
 registry.Register(new PerformanceMonitor());
 registry.Register(new LoggingTool());
 
+// 工具註冊系統中定義但未註冊的工具
+registry.Register(new FileSearchTool());
+registry.Register(new GitTool());
+
 var agent = new AgentLoop(client, registry);
 
 while (true)
