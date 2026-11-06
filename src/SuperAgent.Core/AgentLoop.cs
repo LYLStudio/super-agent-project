@@ -66,6 +66,9 @@ public class AgentLoopConfig
     public int MaxContextCharacters { get; set; } = 32000;
     public bool EnableToolChoice { get; set; } = true;
     public bool ShowThinkingProcess { get; set; }
+    public string DefaultSystemPrompt { get; set; } = string.Empty;
+    public string Region { get; set; } = "台灣";
+    public string Language { get; set; } = "繁體中文（台灣）";
 }
 
 /// <summary>
@@ -129,16 +132,22 @@ public class AgentLoop
                 }
             }
 
-            if (!_messages.Exists(message => message.Role.Equals("system", StringComparison.OrdinalIgnoreCase)))
-            {
-                _messages.Insert(0, new AgentMessage
-                {
-                    Role = "system",
-                    Content = GetSystemPrompt()
-                });
-            }
-
             _conversationInitialized = true;
+        }
+
+        var systemMessage = _messages.FirstOrDefault(message =>
+            message.Role.Equals("system", StringComparison.OrdinalIgnoreCase));
+        if (systemMessage is null)
+        {
+            _messages.Insert(0, new AgentMessage
+            {
+                Role = "system",
+                Content = GetSystemPrompt()
+            });
+        }
+        else
+        {
+            systemMessage.Content = GetSystemPrompt();
         }
 
         // 加入使用者輸入
@@ -482,7 +491,7 @@ public class AgentLoop
 
     private string GetSystemPrompt()
     {
-        return @"你是一個強悍的 AI Agent，名為 SuperAgent。你有以下能力：
+        var prompt = @"你是一個強悍的 AI Agent，名為 SuperAgent。你有以下能力：
 
 1. **思考與規劃**: 你可以分析複雜任務，將其拆解為小步驟。
 2. **工具使用**: 你可以選擇並執行適當的工具來完成任務。
@@ -502,6 +511,19 @@ public class AgentLoop
 4. 根據結果調整策略
 
 當任務完成時，提供清晰的總結。";
+
+        var sections = new List<string>
+        {
+            prompt,
+            $"回覆語系：{_config.Language}。請使用此語系回覆使用者。",
+            $"地區脈絡：{_config.Region}。涉及日期、時間、貨幣、單位或地區慣例時，優先採用此地區標準；不確定時明確說明。"
+        };
+        if (!string.IsNullOrWhiteSpace(_config.DefaultSystemPrompt))
+        {
+            sections.Add($"使用者設定的系統預設提示詞：\n{_config.DefaultSystemPrompt.Trim()}");
+        }
+
+        return string.Join("\n\n", sections);
     }
 }
 

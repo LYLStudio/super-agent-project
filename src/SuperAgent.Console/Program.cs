@@ -1,7 +1,6 @@
 using Spectre.Console;
 using SuperAgent.Core;
 using SuperAgent.Client;
-using BoxOfYellow.ConsoleMarkdownRenderer.Spectre;
 using Microsoft.Extensions.Configuration;
 using System.Globalization;
 using System.Text.Json;
@@ -81,7 +80,10 @@ var agentConfig = new AgentLoopConfig
     Temperature = ReadDoubleSetting("Agent:Temperature", 0.7),
     MaxTokens = ReadIntSetting("Agent:MaxTokens", 4000),
     MaxContextCharacters = ReadIntSetting("Agent:MaxContextCharacters", 32000),
-    ShowThinkingProcess = ReadBoolSetting("Agent:ShowThinkingProcess", false)
+    ShowThinkingProcess = ReadBoolSetting("Agent:ShowThinkingProcess", false),
+    DefaultSystemPrompt = configuration["Agent:DefaultSystemPrompt"] ?? string.Empty,
+    Region = configuration["Agent:Region"] ?? "台灣",
+    Language = configuration["Agent:Language"] ?? "繁體中文（台灣）"
 };
 var workspaceRoot = Path.GetFullPath(
     configuration["Agent:WorkspaceRoot"] ?? Directory.GetCurrentDirectory());
@@ -112,16 +114,10 @@ if (agentConfig.MaxContextCharacters <= 0)
     throw new InvalidOperationException("設定 Agent:MaxContextCharacters 必須大於 0。");
 }
 
-AnsiConsole.MarkupLine("[bold]SuperAgent AI Agent CLI[/]");
-AnsiConsole.MarkupLine($"[bold]Model:[/] {model}");
-AnsiConsole.MarkupLine($"[bold]Endpoint:[/] {baseUrl}");
-AnsiConsole.MarkupLine($"[bold]Max iterations:[/] {agentConfig.MaxIterations}");
-AnsiConsole.MarkupLine($"[bold]Show thinking process:[/] {agentConfig.ShowThinkingProcess}");
-AnsiConsole.MarkupLine($"[bold]Agent 工作區:[/] {Markup.Escape(workspaceAccessPolicy.WorkspaceRoot)}");
-AnsiConsole.MarkupLine($"[bold]允許工作區外存取:[/] {allowOutsideWorkspace}");
-AnsiConsole.MarkupLine($"[bold]工作區外命令存取:[/] {outsideWorkspaceCommandAccess}");
-AnsiConsole.MarkupLine($"[bold]日誌記錄:[/] {(loggingEnabled ? "啟用" : "停用")} ({Markup.Escape(loggingFilePath)}, {logRollingInterval}, {loggingFileSizeLimitMb} MiB)");
-AnsiConsole.MarkupLine("");
+if (string.IsNullOrWhiteSpace(agentConfig.Region) || string.IsNullOrWhiteSpace(agentConfig.Language))
+{
+    throw new InvalidOperationException("設定 Agent:Region 與 Agent:Language 不可為空。");
+}
 
 using var client = new ReloadableAgentClient(new OpenAICompatClient(
     baseUrl,
@@ -130,7 +126,9 @@ using var client = new ReloadableAgentClient(new OpenAICompatClient(
     requestTimeout: TimeSpan.FromSeconds(requestTimeoutSeconds)));
 
 var registry = new ToolRegistry();
-var markdownRenderer = new MarkdownRenderer();
+InteractiveConsoleView? consoleView = InteractiveConsoleView.IsInteractive
+    ? new InteractiveConsoleView($"SuperAgent | {model} | {workspaceAccessPolicy.WorkspaceRoot}")
+    : null;
 var applicationLogger = CreateApplicationLogger();
 ApplyToolConfiguration();
 LogApplicationEvent("info", "Application started", "SuperAgent");
@@ -138,6 +136,16 @@ LogApplicationEvent("info", "Application started", "SuperAgent");
 var agent = new AgentLoop(client, registry, agentConfig);
 var promptHistory = new List<string>();
 var streamedIterations = new HashSet<int>();
+WriteMarkupLine("[bold]SuperAgent AI Agent CLI[/]");
+WriteMarkupLine($"[bold]Model:[/] {model}");
+WriteMarkupLine($"[bold]Endpoint:[/] {baseUrl}");
+WriteMarkupLine($"[bold]Max iterations:[/] {agentConfig.MaxIterations}");
+WriteMarkupLine($"[bold]Show thinking process:[/] {agentConfig.ShowThinkingProcess}");
+WriteMarkupLine($"[bold]Agent 工作區:[/] {Markup.Escape(workspaceAccessPolicy.WorkspaceRoot)}");
+WriteMarkupLine($"[bold]允許工作區外存取:[/] {allowOutsideWorkspace}");
+WriteMarkupLine($"[bold]工作區外命令存取:[/] {outsideWorkspaceCommandAccess}");
+WriteMarkupLine($"[bold]日誌記錄:[/] {(loggingEnabled ? "啟用" : "停用")} ({Markup.Escape(loggingFilePath)}, {logRollingInterval}, {loggingFileSizeLimitMb} MiB)");
+WriteMarkupLine(string.Empty);
 agent.ResponseChunkReceived += (iteration, chunk) =>
 {
     if (!agentConfig.ShowThinkingProcess)
@@ -147,19 +155,19 @@ agent.ResponseChunkReceived += (iteration, chunk) =>
 
     if (streamedIterations.Add(iteration))
     {
-        AnsiConsole.MarkupLine($"[bold cyan]模型處理過程 (串流，第 {iteration} 輪)[/]");
+        WriteOutputSection($"模型串流 / 第 {iteration} 輪", "cyan");
     }
 
-    AnsiConsole.Markup(Markup.Escape(chunk));
+    WriteMarkup(Markup.Escape(chunk));
 };
 agent.ToolExecutionStarted += toolCall =>
 {
     LogApplicationEvent("info", $"Tool started: {toolCall.Name}", "Agent");
     if (agentConfig.ShowThinkingProcess)
     {
-        AnsiConsole.MarkupLine($"[bold yellow]▶ 執行工具: {Markup.Escape(toolCall.Name)}[/]");
-        AnsiConsole.MarkupLine("[yellow]實際參數:[/]");
-        AnsiConsole.WriteLine(JsonSerializer.Serialize(toolCall.Arguments, new JsonSerializerOptions
+        WriteOutputSection($"▶ 工具執行：{toolCall.Name}", "yellow");
+        WriteMarkupLine("[yellow]實際參數:[/]");
+        WriteTextLine(JsonSerializer.Serialize(toolCall.Arguments, new JsonSerializerOptions
         {
             WriteIndented = true
         }));
@@ -170,23 +178,20 @@ agent.ToolExecutionCompleted += (toolCall, result) =>
     LogApplicationEvent("info", $"Tool completed: {toolCall.Name}", "Agent");
     if (agentConfig.ShowThinkingProcess)
     {
-        AnsiConsole.MarkupLine($"[bold magenta]工具結果: {Markup.Escape(toolCall.Name)}[/]");
-        AnsiConsole.WriteLine(result);
+        WriteOutputSection($"工具結果：{toolCall.Name}", "magenta");
+        WriteTextLine(result);
     }
 };
 
 while (true)
 {
-    if (!Console.IsInputRedirected && !Console.IsOutputRedirected)
-    {
-        AnsiConsole.MarkupLine("[grey]F2 設定 | F3 查看日誌 | F5 重新載入設定 | ↑/↓ 提示歷史[/]");
-    }
-
-    AnsiConsole.Markup("[bold green]SuperAgent>[/] ");
+    consoleView?.SetHeader($"SuperAgent | {model} | {workspaceRoot}");
     var promptResult = ReadPromptInput(promptHistory);
     if (promptResult.Shortcut == "settings")
     {
+        consoleView?.Suspend();
         await OpenSettingsMenuAsync();
+        consoleView?.Resume();
         ReloadConfiguration(announce: true);
         continue;
     }
@@ -199,7 +204,16 @@ while (true)
 
     if (promptResult.Shortcut == "logs")
     {
-        ViewLogs();
+        consoleView?.Suspend();
+        var logLines = ViewLogs();
+        consoleView?.Resume();
+        WriteOutputSection($"最近日誌 ({logLines.Count} 筆)", "magenta");
+        foreach (var line in logLines)
+        {
+            WriteMarkupLine(Markup.Escape(line));
+        }
+
+        consoleView?.ScrollToLastSection();
         continue;
     }
 
@@ -217,30 +231,30 @@ while (true)
         input.Trim().Equals("quit", StringComparison.OrdinalIgnoreCase) ||
         input.Trim().Equals("q", StringComparison.OrdinalIgnoreCase))
     {
-        AnsiConsole.MarkupLine("[bold]Goodbye![/]");
+        WriteMarkupLine("[bold]Goodbye![/]");
         break;
     }
 
     if (input.Trim().Equals("help", StringComparison.OrdinalIgnoreCase))
     {
-        AnsiConsole.MarkupLine("[bold]可用命令:[/]");
-        AnsiConsole.MarkupLine("  - exit/quit/q: 結束程式");
-        AnsiConsole.MarkupLine("  - help: 顯示此訊息");
-        AnsiConsole.MarkupLine("  - ↑/↓: 瀏覽已送出的提示歷史");
-        AnsiConsole.MarkupLine("  - ←/→、Home/End: 移動游標");
-        AnsiConsole.MarkupLine("  - F2: 開啟設定選單");
-        AnsiConsole.MarkupLine("  - F3: 查看日誌");
-        AnsiConsole.MarkupLine("  - F5: 熱重載設定檔");
-        AnsiConsole.MarkupLine("");
-        AnsiConsole.MarkupLine("[bold]請直接輸入你的任務指令，Agent 將自動思考與執行。[/]");
-        AnsiConsole.MarkupLine("");
+        WriteMarkupLine("[bold]可用命令:[/]");
+        WriteMarkupLine("  - exit/quit/q: 結束程式");
+        WriteMarkupLine("  - help: 顯示此訊息");
+        WriteMarkupLine("  - ↑/↓: 瀏覽已送出的提示歷史");
+        WriteMarkupLine("  - ←/→、Home/End: 移動游標");
+        WriteMarkupLine("  - F2: 開啟設定選單");
+        WriteMarkupLine("  - F3: 查看日誌");
+        WriteMarkupLine("  - F5: 熱重載設定檔");
+        WriteMarkupLine(string.Empty);
+        WriteMarkupLine("[bold]請直接輸入你的任務指令，Agent 將自動思考與執行。[/]");
+        WriteMarkupLine(string.Empty);
         continue;
     }
 
     promptHistory.Add(input);
     streamedIterations.Clear();
-    AnsiConsole.MarkupLine("[bold]正在處理任務...[/]");
-    AnsiConsole.MarkupLine("");
+    WriteOutputSection("正在處理任務", "cyan");
+    WriteMarkupLine(string.Empty);
 
     try
     {
@@ -251,25 +265,34 @@ while (true)
             $"Agent request completed: success={result.Success}, state={result.FinalState}, iterations={result.TotalIterations}",
             "Agent");
 
-        AnsiConsole.MarkupLine($"[bold]狀態:[/] {result.FinalState}");
-        AnsiConsole.MarkupLine($"[bold]迭代次數:[/] {result.TotalIterations}");
-        AnsiConsole.MarkupLine($"[bold]成功:[/] {result.Success}");
+        WriteMarkupLine(string.Empty);
+        WriteMarkupLine($"[bold]狀態:[/] {result.FinalState}");
+        WriteMarkupLine($"[bold]迭代次數:[/] {result.TotalIterations}");
+        WriteMarkupLine($"[bold]成功:[/] {result.Success}");
 
         if (!string.IsNullOrEmpty(result.Error))
-            AnsiConsole.MarkupLine($"[red]錯誤:[/] {Markup.Escape(result.Error)}");
+            WriteMarkupLine($"[red]錯誤:[/] {Markup.Escape(result.Error)}");
 
-        AnsiConsole.MarkupLine("");
-        AnsiConsole.MarkupLine("[bold green]最終回答:[/]");
-        AnsiConsole.Write(markdownRenderer.Render(result.FinalContent).Root ?? Text.Empty);
-        AnsiConsole.MarkupLine("");
+        WriteOutputSection("最終回答", "green");
+        if (string.IsNullOrWhiteSpace(result.FinalContent))
+        {
+            WriteMarkupLine("[yellow]（模型未返回文字內容）[/]");
+        }
+        else
+        {
+            WriteTextLine(result.FinalContent);
+        }
+        WriteMarkupLine(string.Empty);
     }
     catch (Exception ex)
     {
         LogApplicationEvent("error", $"Agent request failed: {ex.GetType().Name}", "Agent");
-        AnsiConsole.MarkupLine($"[red]發生錯誤:[/] {Markup.Escape(ex.Message)}");
-        AnsiConsole.MarkupLine("");
+        WriteMarkupLine($"[red]發生錯誤:[/] {Markup.Escape(ex.Message)}");
+        WriteMarkupLine(string.Empty);
     }
 }
+
+consoleView?.Dispose();
 
 void ApplyToolConfiguration()
 {
@@ -288,7 +311,8 @@ void ApplyToolConfiguration()
             loggingEnabled,
             loggingFilePath,
             logRollingInterval,
-            checked((long)loggingFileSizeLimitMb * 1024 * 1024)),
+            checked((long)loggingFileSizeLimitMb * 1024 * 1024),
+            echoToConsole: consoleView is null),
         new FileSearchTool(workspaceAccessPolicy),
         new ShellExecTool(
             workspaceAccessPolicy.WorkspaceRoot,
@@ -330,13 +354,59 @@ void ApplyToolConfiguration()
     }
 }
 
+void WriteMarkupLine(string value)
+{
+    if (consoleView is null)
+    {
+        AnsiConsole.MarkupLine(value);
+        return;
+    }
+
+    consoleView.AppendMarkupLine(value);
+}
+
+void WriteOutputSection(string title, string color)
+{
+    if (consoleView is null)
+    {
+        WriteMarkupLine(string.Empty);
+        WriteMarkupLine($"[bold {color}]── {Markup.Escape(title)} ──[/]");
+        return;
+    }
+
+    consoleView.AppendSectionHeader(title, color);
+}
+
+void WriteMarkup(string value)
+{
+    if (consoleView is null)
+    {
+        AnsiConsole.Markup(value);
+        return;
+    }
+
+    consoleView.AppendMarkup(value);
+}
+
+void WriteTextLine(string value)
+{
+    if (consoleView is null)
+    {
+        AnsiConsole.WriteLine(value);
+        return;
+    }
+
+    consoleView.AppendText(value + Environment.NewLine);
+}
+
 LoggingTool CreateApplicationLogger()
 {
     return new LoggingTool(
         loggingEnabled,
         loggingFilePath,
         logRollingInterval,
-        checked((long)loggingFileSizeLimitMb * 1024 * 1024));
+        checked((long)loggingFileSizeLimitMb * 1024 * 1024),
+        echoToConsole: consoleView is null);
 }
 
 void LogApplicationEvent(string level, string message, string source)
@@ -344,7 +414,7 @@ void LogApplicationEvent(string level, string message, string source)
     var result = applicationLogger.WriteApplicationEvent(level, message, source);
     if (result.StartsWith("❌", StringComparison.Ordinal))
     {
-        AnsiConsole.MarkupLine($"[red]應用程式日誌寫入失敗:[/] {Markup.Escape(result)}");
+        WriteMarkupLine($"[red]應用程式日誌寫入失敗:[/] {Markup.Escape(result)}");
     }
 }
 
@@ -429,7 +499,7 @@ async Task OpenSettingsMenuAsync()
         var setting = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("[bold]設定 (儲存後返回會立即套用)[/]")
-                .PageSize(18)
+                .PageSize(22)
                 .AddChoices(
                     "API 端點 URL",
                     "API 密鑰",
@@ -440,6 +510,9 @@ async Task OpenSettingsMenuAsync()
                     "最大輸出 Token",
                     "上下文字元上限",
                     "顯示處理過程",
+                    "系統預設提示詞",
+                    "地區",
+                    "語系",
                     "Agent 工作區路徑",
                     "允許工作區外存取",
                     "工作區外命令存取",
@@ -477,7 +550,7 @@ async Task OpenSettingsMenuAsync()
     }
 }
 
-void ViewLogs()
+IReadOnlyList<string> ViewLogs()
 {
     var filter = AnsiConsole.Prompt(
         new TextPrompt<string>("日誌篩選文字 (可留空):")
@@ -494,35 +567,20 @@ void ViewLogs()
         var entries = logReader.ReadRecentLogs(limit: 50, query: filter);
         if (entries.Count == 0)
         {
-            AnsiConsole.MarkupLine("[yellow]找不到符合條件的日誌紀錄。[/]");
-            return;
+            return [$"找不到符合條件的日誌紀錄。日誌路徑：{loggingFilePath}"];
         }
 
-        var table = new Table()
-            .Border(TableBorder.Rounded)
-            .Title($"最近日誌 (顯示 {entries.Count} 筆，最多 50 筆)")
-            .AddColumn("UTC 時間")
-            .AddColumn("級別")
-            .AddColumn("來源")
-            .AddColumn("訊息");
-
-        foreach (var entry in entries)
+        return entries.Select(entry =>
         {
             var message = entry.Message.Length > 180
                 ? entry.Message[..177] + "..."
                 : entry.Message;
-            table.AddRow(
-                Markup.Escape(entry.Timestamp),
-                Markup.Escape(entry.Level),
-                Markup.Escape(entry.Source),
-                Markup.Escape(message));
-        }
-
-        AnsiConsole.Write(table);
+            return $"{entry.Timestamp} [{entry.Level}] [{entry.Source}] {message}";
+        }).ToList();
     }
     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
     {
-        AnsiConsole.MarkupLine($"[red]讀取日誌失敗:[/] {Markup.Escape(ex.Message)}");
+        return [$"讀取日誌失敗：{ex.Message}"];
     }
 }
 
@@ -645,6 +703,9 @@ void ReloadConfiguration(bool announce)
         var nextMaxContextCharacters = ReadIntSetting("Agent:MaxContextCharacters", 32000);
         var nextTemperature = ReadDoubleSetting("Agent:Temperature", 0.7);
         var nextShowThinking = ReadBoolSetting("Agent:ShowThinkingProcess", false);
+        var nextDefaultSystemPrompt = configuration["Agent:DefaultSystemPrompt"] ?? string.Empty;
+        var nextRegion = configuration["Agent:Region"] ?? "台灣";
+        var nextLanguage = configuration["Agent:Language"] ?? "繁體中文（台灣）";
         var nextLoggingEnabled = ReadBoolSetting("Logging:Enabled", true);
         var nextLoggingFilePath = configuration["Logging:Path"] ?? Path.Combine("logs", "superagent.log");
         var nextLogRollingInterval = ReadLogRollingInterval();
@@ -654,6 +715,8 @@ void ReloadConfiguration(bool announce)
             nextMaxIterations is < 1 or > 100 ||
             nextMaxTokens is < 1 or > 64000 ||
             nextMaxContextCharacters <= 0 ||
+            string.IsNullOrWhiteSpace(nextRegion) ||
+            string.IsNullOrWhiteSpace(nextLanguage) ||
             string.IsNullOrWhiteSpace(nextLoggingFilePath) ||
             nextLoggingFileSizeLimitMb <= 0 ||
             !double.IsFinite(nextTemperature) ||
@@ -695,23 +758,27 @@ void ReloadConfiguration(bool announce)
         agentConfig.MaxContextCharacters = nextMaxContextCharacters;
         agentConfig.Temperature = nextTemperature;
         agentConfig.ShowThinkingProcess = nextShowThinking;
+        agentConfig.DefaultSystemPrompt = nextDefaultSystemPrompt;
+        agentConfig.Region = nextRegion;
+        agentConfig.Language = nextLanguage;
 
         ApplyToolConfiguration();
         client.Replace(nextClient);
         LogApplicationEvent("info", "Configuration reloaded", "SuperAgent");
+        consoleView?.SetHeader($"SuperAgent | {model} | {workspaceRoot}");
 
         (previousConfiguration as IDisposable)?.Dispose();
         if (announce)
         {
-            AnsiConsole.MarkupLine("[green]設定已熱重載並套用至後續對話。[/]");
-            AnsiConsole.MarkupLine($"[grey]模型: {Markup.Escape(model)} | 工作區: {Markup.Escape(workspaceRoot)} | 檔案工作區外存取: {allowOutsideWorkspace} | 工作區外命令存取: {outsideWorkspaceCommandAccess} | 日誌: {(loggingEnabled ? "啟用" : "停用")}[/]");
+            WriteMarkupLine("[green]設定已熱重載並套用至後續對話。[/]");
+            WriteMarkupLine($"[grey]模型: {Markup.Escape(model)} | 工作區: {Markup.Escape(workspaceRoot)} | 檔案工作區外存取: {allowOutsideWorkspace} | 工作區外命令存取: {outsideWorkspaceCommandAccess} | 日誌: {(loggingEnabled ? "啟用" : "停用")}[/]");
         }
     }
     catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or IOException or UnauthorizedAccessException or FormatException or ArgumentException)
     {
         configuration = previousConfiguration;
         (nextConfiguration as IDisposable)?.Dispose();
-        AnsiConsole.MarkupLine($"[red]設定重載失敗，保留目前設定: {Markup.Escape(ex.Message)}[/]");
+        WriteMarkupLine($"[red]設定重載失敗，保留目前設定: {Markup.Escape(ex.Message)}[/]");
     }
 }
 
@@ -838,6 +905,11 @@ Task<bool> ConfirmOutsideWorkspaceCommandAsync(string path, CancellationToken ca
 
 (string? Input, string? Shortcut) ReadPromptInput(IReadOnlyList<string> history)
 {
+    if (consoleView is not null)
+    {
+        return consoleView.ReadInput(history);
+    }
+
     if (Console.IsInputRedirected || Console.IsOutputRedirected)
     {
         return (Console.ReadLine(), null);
@@ -1040,6 +1112,9 @@ void EditConfigurationSetting(string path, string setting)
         "最大輸出 Token" => ("Agent", "MaxTokens", "tokens", "4000"),
         "上下文字元上限" => ("Agent", "MaxContextCharacters", "positiveInt", "32000"),
         "顯示處理過程" => ("Agent", "ShowThinkingProcess", "bool", "false"),
+        "系統預設提示詞" => ("Agent", "DefaultSystemPrompt", "multiline", ""),
+        "地區" => ("Agent", "Region", "string", "台灣"),
+        "語系" => ("Agent", "Language", "string", "繁體中文（台灣）"),
         "Agent 工作區路徑" => ("Agent", "WorkspaceRoot", "directory", Directory.GetCurrentDirectory()),
         "允許工作區外存取" => ("Agent", "AllowOutsideWorkspace", "bool", "false"),
         "日誌記錄啟用" => ("Logging", "Enabled", "bool", "true"),
@@ -1055,7 +1130,30 @@ void EditConfigurationSetting(string path, string setting)
     var currentValue = section[key]?.ToString() ?? defaultValue;
     JsonNode? updatedValue;
 
-    if (type == "bool")
+    if (type == "multiline")
+    {
+        Console.WriteLine($"目前系統預設提示詞：{(string.IsNullOrEmpty(currentValue) ? "（未設定）" : Environment.NewLine + currentValue)}");
+        Console.WriteLine("輸入新的多行提示詞；單獨輸入 :save 儲存，單獨輸入 :clear 清除。");
+        var lines = new List<string>();
+        while (Console.ReadLine() is { } line)
+        {
+            if (line == ":clear")
+            {
+                lines.Clear();
+                break;
+            }
+
+            if (line == ":save")
+            {
+                break;
+            }
+
+            lines.Add(line);
+        }
+
+        updatedValue = JsonValue.Create(string.Join(Environment.NewLine, lines));
+    }
+    else if (type == "bool")
     {
         var current = bool.TryParse(currentValue, out var parsed) && parsed;
         var selected = AnsiConsole.Prompt(

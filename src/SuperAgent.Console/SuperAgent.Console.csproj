@@ -18,7 +18,6 @@
     <ProjectReference Include="../SuperAgent.Core/SuperAgent.Core.csproj" />
     <ProjectReference Include="../SuperAgent.Client/SuperAgent.Client.csproj" />
     <PackageReference Include="Spectre.Console" Version="0.57.2" />
-    <PackageReference Include="BoxOfYellow.ConsoleMarkdownRenderer.Spectre" Version="0.12.6" />
     <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.14" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.14" />
     <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.14" />

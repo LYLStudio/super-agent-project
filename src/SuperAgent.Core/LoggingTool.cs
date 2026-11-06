@@ -32,12 +32,14 @@ public class LoggingTool : ITool
     private readonly string _logFilePath;
     private readonly LogRollingInterval _rollingInterval;
     private readonly long _fileSizeLimitBytes;
+    private readonly bool _echoToConsole;
 
     public LoggingTool(
         bool enabled = true,
         string? logFilePath = null,
         LogRollingInterval rollingInterval = LogRollingInterval.Day,
-        long fileSizeLimitBytes = 10 * 1024 * 1024)
+        long fileSizeLimitBytes = 10 * 1024 * 1024,
+        bool echoToConsole = true)
     {
         if (!Enum.IsDefined(rollingInterval))
         {
@@ -53,6 +55,7 @@ public class LoggingTool : ITool
         _logFilePath = Path.GetFullPath(logFilePath ?? Path.Combine("logs", "superagent.log"));
         _rollingInterval = rollingInterval;
         _fileSizeLimitBytes = fileSizeLimitBytes;
+        _echoToConsole = echoToConsole;
     }
 
     public enum LogLevel
@@ -178,7 +181,7 @@ public class LoggingTool : ITool
         switch (action.ToLower())
         {
             case "write":
-                return WriteLog(level, message, source, echoToConsole: true);
+                return WriteLog(level, message, source, _echoToConsole);
             case "query":
                 return QueryLogs(query, limit);
             case "clear":

@@ -105,6 +105,53 @@ public class AgentLoopTests
     }
 
     [Fact]
+    public async Task AgentLoop_IncludesDefaultPromptRegionAndLanguageInSystemMessage()
+    {
+        var client = new RecordingAgentClient();
+        var agent = new AgentLoop(client, new ToolRegistry(), new AgentLoopConfig
+        {
+            DefaultSystemPrompt = "Prefer concise explanations.",
+            Region = "日本",
+            Language = "日本語"
+        });
+
+        await agent.RunAsync("hello");
+
+        var systemPrompt = Assert.Single(client.Requests[0].Messages
+            .Where(message => message.Role == "system")).Content;
+        Assert.Contains("Prefer concise explanations.", systemPrompt);
+        Assert.Contains("地區脈絡：日本", systemPrompt);
+        Assert.Contains("回覆語系：日本語", systemPrompt);
+    }
+
+    [Fact]
+    public async Task AgentLoop_UpdatesSystemPromptWhenConfigurationChangesBetweenRuns()
+    {
+        var client = new RecordingAgentClient();
+        var config = new AgentLoopConfig
+        {
+            DefaultSystemPrompt = "First instructions",
+            Region = "台灣",
+            Language = "繁體中文"
+        };
+        var agent = new AgentLoop(client, new ToolRegistry(), config);
+
+        await agent.RunAsync("first task");
+        config.DefaultSystemPrompt = "Updated instructions";
+        config.Region = "加拿大";
+        config.Language = "English";
+        await agent.RunAsync("second task");
+
+        var secondRequest = client.Requests[1];
+        var systemPrompt = Assert.Single(secondRequest.Messages
+            .Where(message => message.Role == "system")).Content;
+        Assert.Contains("Updated instructions", systemPrompt);
+        Assert.Contains("地區脈絡：加拿大", systemPrompt);
+        Assert.Contains("回覆語系：English", systemPrompt);
+        Assert.DoesNotContain("First instructions", systemPrompt);
+    }
+
+    [Fact]
     public async Task AgentLoop_TrimsOlderTurnsToContextBudget()
     {
         var client = new RecordingAgentClient();
