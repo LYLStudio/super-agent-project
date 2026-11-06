@@ -27,8 +27,8 @@ WORKDIR /app
 COPY --from=build /app .
 
 # Set environment variables (override with actual values at runtime)
-ENV OPENAI_BASE_URL="http://localhost:8080"
-ENV OPENAI_MODEL="qwen3-coder:30b"
+ENV OPENAI_BASE_URL="http://192.168.1.102:11434/v1"
+ENV OPENAI_MODEL="gpt-oss:20b"
 ENV SUPERAGENT_ENCRYPTION_KEY="default-encryption-key"
 
 # Expose port

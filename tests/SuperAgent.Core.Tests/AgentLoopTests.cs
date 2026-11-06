@@ -41,5 +41,31 @@ public class AgentLoopTests
         Assert.Equal(0.7, config.Temperature, 0.001);
         Assert.Equal(4000, config.MaxTokens);
         Assert.True(config.EnableToolChoice);
+        Assert.False(config.ShowThinkingProcess);
+    }
+
+    [Fact]
+    public async Task AgentLoop_ReportsThinkingResponsesOnlyWhenEnabled()
+    {
+        var client = new IntegrationMockClient();
+        var registry = new ToolRegistry();
+        var hiddenAgent = new AgentLoop(client, registry, new AgentLoopConfig
+        {
+            ShowThinkingProcess = false
+        });
+        var visibleAgent = new AgentLoop(client, registry, new AgentLoopConfig
+        {
+            ShowThinkingProcess = true
+        });
+        var thinkingResponses = new List<(int Iteration, AgentMessage Response)>();
+        visibleAgent.ThinkingResponseReceived += (iteration, response) =>
+            thinkingResponses.Add((iteration, response));
+
+        await hiddenAgent.RunAsync("測試隱藏思考過程");
+        await visibleAgent.RunAsync("測試顯示思考過程");
+
+        var thinkingResponse = Assert.Single(thinkingResponses);
+        Assert.Equal(1, thinkingResponse.Iteration);
+        Assert.Contains("測試顯示思考過程", thinkingResponse.Response.Content);
     }
 }

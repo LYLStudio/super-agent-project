@@ -180,47 +180,86 @@ public class ShellExecTool : ITool
 
         try
         {
-            var startInfo = new System.Diagnostics.ProcessStartInfo
+            if (timeout <= 0)
+            {
+                return "Error executing command: timeout_seconds must be greater than zero";
+            }
+
+            var startInfo = new ProcessStartInfo
             {
                 FileName = "bash",
-                Arguments = "-c \"" + command + "\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+            startInfo.ArgumentList.Add("-c");
+            startInfo.ArgumentList.Add(command);
 
-            System.Diagnostics.Process? process = System.Diagnostics.Process.Start(startInfo);
-            if (process is null)
+            using var process = new Process { StartInfo = startInfo };
+            if (!process.Start())
             {
                 return "Error: Unable to start process";
             }
 
-            await process.WaitForExitAsync(cancellationToken);
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                timeoutCts.Token);
 
-            var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            try
+            {
+                await process.WaitForExitAsync(linkedCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None);
+                var timedOutOutput = await outputTask;
+                var timedOutError = await errorTask;
+                var reason = cancellationToken.IsCancellationRequested
+                    ? "cancelled"
+                    : $"timed out after {timeout} seconds";
+                return FormatProcessResult(
+                    timedOutOutput,
+                    timedOutError,
+                    process.ExitCode,
+                    $"Command {reason}");
+            }
 
             var output = await outputTask;
             var error = await errorTask;
-
-            var result = new System.Text.StringBuilder();
-            if (!string.IsNullOrEmpty(output))
-            {
-                result.AppendLine($"STDOUT:{output}");
-            }
-            if (!string.IsNullOrEmpty(error))
-            {
-                result.AppendLine($"STDERR:{error}");
-            }
-            result.AppendLine($"Exit code: {process.ExitCode}");
-
-            return result.ToString();
+            return FormatProcessResult(output, error, process.ExitCode);
         }
         catch (Exception ex)
         {
             return $"Error executing command: {ex.Message}";
         }
+    }
+
+    private static string FormatProcessResult(
+        string output,
+        string error,
+        int exitCode,
+        string? status = null)
+    {
+        var result = new StringBuilder();
+        if (!string.IsNullOrEmpty(status))
+        {
+            result.AppendLine($"{status}.");
+        }
+        if (!string.IsNullOrEmpty(output))
+        {
+            result.AppendLine($"STDOUT:{output}");
+        }
+        if (!string.IsNullOrEmpty(error))
+        {
+            result.AppendLine($"STDERR:{error}");
+        }
+        result.AppendLine($"Exit code: {exitCode}");
+        return result.ToString();
     }
 }
 
@@ -384,9 +423,45 @@ public class GitTool : ITool
 /// </summary>
 public class WebSearchTool : ITool
 {
+    private const string BingSearchEndpoint = "https://www.bing.com/search";
+    private const string DuckDuckGoSearchEndpoint = "https://html.duckduckgo.com/html/";
+    private const int MaximumResults = 10;
+    private static readonly HttpClient SharedHttpClient = CreateHttpClient();
+    private static readonly Regex BingResultRegex = new(
+        @"<li\b(?=[^>]*\bclass\s*=\s*[""'][^""']*\bb_algo\b)[^>]*>(?<content>.*?)</li\s*>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex BingTitleRegex = new(
+        @"<h2\b[^>]*>\s*<a\b(?<attributes>[^>]*)>(?<content>.*?)</a\s*>\s*</h2\s*>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex ParagraphRegex = new(
+        @"<p\b[^>]*>(?<content>.*?)</p\s*>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex AnchorRegex = new(
+        @"<a\b(?<attributes>[^>]*)>(?<content>.*?)</a\s*>",
+        RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex AttributeRegex = new(
+        @"(?<name>[\w:-]+)\s*=\s*(?:""(?<double>[^""]*)""|'(?<single>[^']*)'|(?<unquoted>[^\s>]+))",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex TagRegex = new(
+        @"<[^>]+>",
+        RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex WhitespaceRegex = new(
+        @"\s+",
+        RegexOptions.Compiled);
+    private readonly HttpClient _httpClient;
+
+    public WebSearchTool() : this(SharedHttpClient)
+    {
+    }
+
+    public WebSearchTool(HttpClient httpClient)
+    {
+        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+    }
+
     public string Name => "web_search";
 
-    public string Description => "搜尋網頁內容。支援搜尋查詢與擷取網頁內容。適用於查詢資訊、查找文件與取得網頁內容。";
+    public string Description => "透過 Bing 搜尋真實網頁，並在無法使用時改用 DuckDuckGo，回傳標題、網址與搜尋摘要。適用於查詢資訊、查找文件與取得網頁內容。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
@@ -394,21 +469,38 @@ public class WebSearchTool : ITool
         properties = new
         {
             query = new { type = "string", description = "搜尋查詢字串" },
-            max_results = new { type = "number", description = "最大結果數量 (預設 5)" },
-            extract_content = new { type = "boolean", description = "是否擷取網頁內容 (預設 true)" }
+            max_results = new { type = "integer", description = "最大結果數量，範圍 1 到 10 (預設 5)" },
+            extract_content = new { type = "boolean", description = "是否顯示搜尋引擎提供的頁面摘要 (預設 true)" }
         },
         required = new[] { "query" }
     });
 
     public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
     {
-        string query = arguments.GetProperty("query").GetString() ?? string.Empty;
-        int maxResults = arguments.TryGetProperty("max_results", out var maxProp)
-            ? (int)maxProp.GetDouble()
-            : 5;
-        bool extractContent = arguments.TryGetProperty("extract_content", out var extractProp)
-            ? extractProp.GetBoolean()
-            : true;
+        if (!arguments.TryGetProperty("query", out var queryProperty) ||
+            queryProperty.ValueKind != JsonValueKind.String)
+        {
+            return "Error: 搜尋查詢必須是文字";
+        }
+
+        var query = queryProperty.GetString() ?? string.Empty;
+        var maxResults = 5;
+        if (arguments.TryGetProperty("max_results", out var maxProp) &&
+            (!maxProp.TryGetInt32(out maxResults) || maxResults is < 1 or > MaximumResults))
+        {
+            return $"Error: max_results 必須介於 1 到 {MaximumResults}";
+        }
+
+        var extractContent = true;
+        if (arguments.TryGetProperty("extract_content", out var extractProp))
+        {
+            if (extractProp.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            {
+                return "Error: extract_content 必須是布林值";
+            }
+
+            extractContent = extractProp.GetBoolean();
+        }
 
         if (string.IsNullOrWhiteSpace(query))
         {
@@ -417,33 +509,267 @@ public class WebSearchTool : ITool
 
         try
         {
-            var results = new List<string>
+            var searchAttempts = new List<string>();
+            foreach (var provider in new[]
             {
-                $"搜尋 '{query}' 的相關資訊 (模擬結果)",
-                $"  - 結果 1: 關於 {query} 的資訊頁面 (https://example.com/result1)",
-                $"  - 結果 2: {query} 詳細說明 (https://example.com/result2)",
-                $"  - 結果 3: {query} 教學指南 (https://example.com/result3)"
-            };
-
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"搜尋查詢: {query}");
-            sb.AppendLine($"找到 {maxResults} 個結果:");
-            sb.AppendLine();
-
-            for (int i = 0; i < Math.Min(maxResults, results.Count); i++)
+            (Name: "Bing", Endpoint: BingSearchEndpoint, Parse: (Func<string, int, List<SearchResult>>)ParseBingResults),
+            (Name: "DuckDuckGo", Endpoint: DuckDuckGoSearchEndpoint, Parse: (Func<string, int, List<SearchResult>>)ParseResults)
+            })
             {
-                sb.AppendLine($"[{i + 1}] {results[i]}");
-                if (extractContent && i < 3)
+            try
+            {
+                var requestUri = $"{provider.Endpoint}?q={Uri.EscapeDataString(query)}";
+                using var response = await _httpClient.GetAsync(
+                    requestUri,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
+                response.EnsureSuccessStatusCode();
+
+                var html = await response.Content.ReadAsStringAsync(cancellationToken);
+                if (IsVerificationChallenge(provider.Name, html))
                 {
-                    sb.AppendLine($"    內容摘要: 這是關於 {query} 的相關內容摘要...");
+                    searchAttempts.Add($"{provider.Name} returned a verification challenge");
+                    continue;
                 }
+
+                var results = provider.Parse(html, maxResults);
+                if (results.Count == 0)
+                {
+                    searchAttempts.Add($"{provider.Name} returned no parseable results");
+                    continue;
+                }
+
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"搜尋查詢: {query} (來源: {provider.Name})");
+                sb.AppendLine($"找到 {results.Count} 個結果:");
+                sb.AppendLine();
+
+                for (var i = 0; i < results.Count; i++)
+                {
+                    var result = results[i];
+                    sb.AppendLine($"[{i + 1}] {result.Title}");
+                    sb.AppendLine($"    網址: {result.Url}");
+                    if (extractContent && !string.IsNullOrWhiteSpace(result.Snippet))
+                    {
+                        sb.AppendLine($"    摘要: {result.Snippet}");
+                    }
+                    sb.AppendLine();
+                }
+
+                return sb.ToString();
+            }
+            catch (HttpRequestException ex)
+            {
+                searchAttempts.Add($"{provider.Name}: {ex.Message}");
+            }
+            catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                searchAttempts.Add($"{provider.Name} timed out: {ex.Message}");
+            }
             }
 
-            return sb.ToString();
+            return searchAttempts.Count > 0
+            ? $"Error executing web search: all search providers failed ({string.Join("; ", searchAttempts)})."
+            : $"搜尋查詢: {query}\n未找到搜尋結果。";
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return $"Error executing web search: {ex.Message}";
+            throw;
         }
     }
+
+    private static HttpClient CreateHttpClient()
+    {
+        var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(20)
+        };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (compatible; SuperAgent/1.0; +https://github.com/LYLStudio/super-agent-project)");
+        client.DefaultRequestHeaders.Accept.ParseAdd("text/html");
+        return client;
+    }
+
+    private static List<SearchResult> ParseResults(string html, int maxResults)
+    {
+        var results = new List<SearchResult>();
+        var snippets = new List<string>();
+        foreach (Match match in AnchorRegex.Matches(html))
+        {
+            var attributes = ParseAttributes(match.Groups["attributes"].Value);
+            if (!attributes.TryGetValue("class", out var classNames))
+            {
+                continue;
+            }
+
+            var content = NormalizeHtmlText(match.Groups["content"].Value);
+            if (classNames.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains("result__snippet"))
+            {
+                snippets.Add(content);
+                continue;
+            }
+
+            if (!classNames.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains("result__a") ||
+                !attributes.TryGetValue("href", out var href))
+            {
+                continue;
+            }
+
+            var url = ResolveResultUrl(href);
+            if (url is null || string.IsNullOrWhiteSpace(content))
+            {
+                continue;
+            }
+
+            results.Add(new SearchResult(content, url, string.Empty));
+        }
+
+        for (var i = 0; i < results.Count && i < snippets.Count; i++)
+        {
+            results[i] = results[i] with { Snippet = snippets[i] };
+        }
+
+        return results.Take(maxResults).ToList();
+    }
+
+    private static List<SearchResult> ParseBingResults(string html, int maxResults)
+    {
+        var results = new List<SearchResult>();
+        foreach (Match resultMatch in BingResultRegex.Matches(html))
+        {
+            var resultHtml = resultMatch.Groups["content"].Value;
+            var titleMatch = BingTitleRegex.Match(resultHtml);
+            if (!titleMatch.Success)
+            {
+                continue;
+            }
+
+            var attributes = ParseAttributes(titleMatch.Groups["attributes"].Value);
+            if (!attributes.TryGetValue("href", out var href))
+            {
+                continue;
+            }
+
+            var url = ResolveBingResultUrl(href);
+            var title = NormalizeHtmlText(titleMatch.Groups["content"].Value);
+            if (url is null || string.IsNullOrWhiteSpace(title))
+            {
+                continue;
+            }
+
+            var snippetMatch = ParagraphRegex.Match(resultHtml);
+            var snippet = snippetMatch.Success
+                ? NormalizeHtmlText(snippetMatch.Groups["content"].Value)
+                : string.Empty;
+            results.Add(new SearchResult(title, url, snippet));
+            if (results.Count == maxResults)
+            {
+                break;
+            }
+        }
+
+        return results;
+    }
+
+    private static string? ResolveBingResultUrl(string href)
+    {
+        if (!Uri.TryCreate(new Uri("https://www.bing.com"), href, out var uri) ||
+            uri.Scheme is not ("http" or "https"))
+        {
+            return null;
+        }
+
+        if (!uri.Host.Equals("www.bing.com", StringComparison.OrdinalIgnoreCase) ||
+            !uri.AbsolutePath.Equals("/ck/a", StringComparison.OrdinalIgnoreCase))
+        {
+            return uri.AbsoluteUri;
+        }
+
+        var encodedDestination = uri.Query
+            .TrimStart('?')
+            .Split('&', StringSplitOptions.RemoveEmptyEntries)
+            .Select(parameter => parameter.Split('=', 2))
+            .FirstOrDefault(parts => parts.Length == 2 && parts[0] == "u")?
+            .ElementAtOrDefault(1);
+        if (encodedDestination is null || !encodedDestination.StartsWith("a1", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        try
+        {
+            var base64 = encodedDestination[2..]
+                .Replace('-', '+')
+                .Replace('_', '/');
+            base64 = base64.PadRight(base64.Length + (4 - base64.Length % 4) % 4, '=');
+            var destination = Encoding.UTF8.GetString(Convert.FromBase64String(base64));
+            return Uri.TryCreate(destination, UriKind.Absolute, out var resultUri) &&
+                   resultUri.Scheme is "http" or "https"
+                ? resultUri.AbsoluteUri
+                : null;
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsVerificationChallenge(string provider, string html)
+    {
+        return provider == "DuckDuckGo"
+            ? html.Contains("anomaly-modal", StringComparison.OrdinalIgnoreCase)
+            : html.Contains("b_captcha", StringComparison.OrdinalIgnoreCase) ||
+              html.Contains("captcha", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, string> ParseAttributes(string attributes)
+    {
+        var parsed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match match in AttributeRegex.Matches(attributes))
+        {
+            var value = match.Groups["double"].Success
+                ? match.Groups["double"].Value
+                : match.Groups["single"].Success
+                    ? match.Groups["single"].Value
+                    : match.Groups["unquoted"].Value;
+            parsed[match.Groups["name"].Value] = System.Net.WebUtility.HtmlDecode(value);
+        }
+
+        return parsed;
+    }
+
+    private static string? ResolveResultUrl(string href)
+    {
+        if (!Uri.TryCreate(new Uri("https://duckduckgo.com"), href, out var uri) ||
+            uri.Scheme is not ("http" or "https"))
+        {
+            return null;
+        }
+
+        if (uri.Host.EndsWith("duckduckgo.com", StringComparison.OrdinalIgnoreCase) &&
+            uri.AbsolutePath.Equals("/l/", StringComparison.OrdinalIgnoreCase))
+        {
+            var destination = uri.Query
+                .TrimStart('?')
+                .Split('&', StringSplitOptions.RemoveEmptyEntries)
+                .Select(parameter => parameter.Split('=', 2))
+                .FirstOrDefault(parts => parts.Length == 2 && parts[0] == "uddg");
+            if (destination is null ||
+                !Uri.TryCreate(Uri.UnescapeDataString(destination[1]), UriKind.Absolute, out uri))
+            {
+                return null;
+            }
+        }
+
+        return uri.Scheme is "http" or "https" ? uri.AbsoluteUri : null;
+    }
+
+    private static string NormalizeHtmlText(string html)
+    {
+        var withoutTags = TagRegex.Replace(html, " ");
+        var decoded = System.Net.WebUtility.HtmlDecode(withoutTags);
+        return WhitespaceRegex.Replace(decoded, " ").Trim();
+    }
+
+    private sealed record SearchResult(string Title, string Url, string Snippet);
 }

@@ -5,9 +5,9 @@ services:
     build: .
     container_name: superagent
     environment:
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://host.docker.internal:8080}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://192.168.1.102:11434/v1}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-qwen3-coder:30b}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-oss:20b}
       - SUPERAGENT_ENCRYPTION_KEY=${SUPERAGENT_ENCRYPTION_KEY}
       - SUPERAGENT_API_KEY=${SUPERAGENT_API_KEY}
     volumes:
@@ -20,7 +20,7 @@ services:
     image: localhost:5000/api-server:latest
     container_name: api-server
     environment:
-      - MODEL_NAME=${MODEL_NAME:-qwen3-coder:30b}
+      - MODEL_NAME=${MODEL_NAME:-gpt-oss:20b}
     ports:
       - "8080:8080"
     restart: unless-stopped

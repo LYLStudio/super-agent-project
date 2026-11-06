@@ -64,6 +64,7 @@ public class AgentLoopConfig
     public double Temperature { get; set; } = 0.7;
     public int MaxTokens { get; set; } = 4000;
     public bool EnableToolChoice { get; set; } = true;
+    public bool ShowThinkingProcess { get; set; }
 }
 
 /// <summary>
@@ -80,6 +81,11 @@ public class AgentLoop
     private readonly string? _conversationId;
     private readonly List<AgentMessage> _messages = new();
     private readonly PerformanceMonitor _performanceMonitor = new();
+
+    public event Action<int, AgentMessage>? ThinkingResponseReceived;
+    public event Action<int, string>? ResponseChunkReceived;
+    public event Action<ToolCall>? ToolExecutionStarted;
+    public event Action<ToolCall, string>? ToolExecutionCompleted;
 
     /// <summary>
     /// 建立 Agent Loop
@@ -154,11 +160,11 @@ public class AgentLoop
             state = AgentLoopState.Thinking;
 
             // 步驟 1: 思考 - 分析當前狀態與任務 (支援重試)
-            AgentMessage? thoughtResponse = null;
+            AgentMessage thoughtResponse;
             try
             {
                 var response = await _retryPolicy.ExecuteAsync(
-                    async (ct) => await GenerateResponseAsync(ct),
+                    async (ct) => await GenerateResponseAsync(ct, iteration),
                     "GenerateResponse",
                     cancellationToken);
                 thoughtResponse = new AgentMessage
@@ -184,8 +190,13 @@ public class AgentLoop
                 };
             }
 
+            if (_config.ShowThinkingProcess)
+            {
+                ThinkingResponseReceived?.Invoke(iteration, thoughtResponse);
+            }
+
             // 檢查是否為錯誤回應
-            if (thoughtResponse is not null && thoughtResponse.Content.StartsWith("錯誤:"))
+            if (thoughtResponse.Content.StartsWith("錯誤:"))
             {
                 state = AgentLoopState.Failed;
                 _messages.Add(thoughtResponse);
@@ -253,7 +264,7 @@ public class AgentLoop
         };
     }
 
-    private async Task<AgentMessage> GenerateResponseAsync(CancellationToken cts)
+    private async Task<AgentMessage> GenerateResponseAsync(CancellationToken cts, int iteration)
     {
         var request = new AgentRequest
         {
@@ -279,7 +290,12 @@ public class AgentLoop
             MaxTokens = _config.MaxTokens
         };
 
-        var response = await _client.GetResponseAsync(request, cts);
+        var response = _config.ShowThinkingProcess && _client is IStreamingAgentClient streamingClient
+            ? await streamingClient.GetResponseAsync(
+                request,
+                chunk => ResponseChunkReceived?.Invoke(iteration, chunk),
+                cts)
+            : await _client.GetResponseAsync(request, cts);
 
         return new AgentMessage
         {
@@ -298,14 +314,18 @@ public class AgentLoop
     {
         foreach (var toolCall in toolCalls)
         {
+            ToolExecutionStarted?.Invoke(toolCall);
             try
             {
                 var result = await _toolRegistry.ExecuteAsync(toolCall.Name, toolCall.Arguments, cts);
                 _toolRegistry.SetResult(toolCall.Id, result);
+                ToolExecutionCompleted?.Invoke(toolCall, result);
             }
             catch (Exception ex)
             {
-                _toolRegistry.SetResult(toolCall.Id, $"Error: {ex.Message}");
+                var result = $"Error: {ex.Message}";
+                _toolRegistry.SetResult(toolCall.Id, result);
+                ToolExecutionCompleted?.Invoke(toolCall, result);
             }
         }
     }
@@ -391,6 +411,14 @@ public class AgentResponse
 public interface IAgentClient
 {
     Task<AgentResponse> GetResponseAsync(AgentRequest request, CancellationToken cancellationToken);
+}
+
+public interface IStreamingAgentClient : IAgentClient
+{
+    Task<AgentResponse> GetResponseAsync(
+        AgentRequest request,
+        Action<string>? onContentChunk,
+        CancellationToken cancellationToken);
 }
 
 /// <summary>

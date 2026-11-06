@@ -30,7 +30,7 @@ docker build -t superagent .
 # 執行容器
 docker run -it \
   -e OPENAI_API_KEY="your-api-key" \
-  -e OPENAI_MODEL="qwen3-coder:30b" \
+  -e OPENAI_MODEL="gpt-oss:20b" \
   -e SUPERAGENT_ENCRYPTION_KEY="your-encryption-key" \
   superagent
 ```
@@ -45,14 +45,18 @@ dotnet build src/SuperAgent.Console/SuperAgent.Console.csproj -c Release
 dotnet run --project src/SuperAgent.Console -- --help
 ```
 
+互動啟動時，程式會向設定的 OpenAI 相容端點查詢 `/models`，並提供可用模型選單；非互動輸入時會沿用 `OpenAI.Model` 或 `OPENAI_MODEL`。Agent 的最終回答會以 Markdown 格式呈現。
+
+`web_search` 工具會優先透過 Bing 搜尋即時網頁，遇到驗證頁或無法解析結果時會改用 DuckDuckGo，回傳標題、連結與搜尋摘要；不需要額外 API 金鑰，但執行環境必須能連線至網際網路。
+
 ## 命令列參數
 
 | 參數 | 說明 | 預設值 |
 |------|------|--------|
-| `--model=NAME` | 使用的模型名稱 | `qwen3-coder:30b` |
+| `--model=NAME` | 使用的模型名稱 | `gpt-oss:20b` |
 | `--api-key=KEY` | API 密鑰 | `dummy` |
 | `--config=PATH` | 設定檔路徑 | `appsettings.json` |
-| `--base-url=URL` | API 端點 URL | `http://localhost:8080` |
+| `--base-url=URL` | OpenAI 相容 API 端點 URL | `http://192.168.1.102:11434/v1` |
 | `--help, -h` | 顯示說明 | - |
 
 ## 可用工具清單
@@ -217,10 +221,13 @@ public class CalculatorTests
 
 ```json
 {
-  "App": {
-    "ApiKey": "your-api-key-here",
-    "Model": "qwen3-coder:30b",
-    "BaseUrl": "http://localhost:8080"
+  "OpenAI": {
+    "BaseUrl": "http://192.168.1.102:11434/v1",
+    "ApiKey": "dummy",
+    "Model": "gpt-oss:20b"
+  },
+  "Agent": {
+    "ShowThinkingProcess": false
   },
   "Logging": {
     "Level": "Info",
@@ -229,13 +236,16 @@ public class CalculatorTests
 }
 ```
 
+`appsettings.json` 會隨建置與發布複製到輸出目錄；程式預設從該設定檔讀取連線資訊。環境變數與命令列參數可覆寫設定值。
+將 `Agent.ShowThinkingProcess` 設為 `true` 可串流顯示模型輸出的處理訊息，並列出工具呼叫的實際參數與執行結果；模型處理訊息以青色、工具呼叫與結果以黃色／紫紅色、最終回答以綠色區分。此處顯示的是模型輸出的訊息，不是隱藏的內部推理內容。預設為 `false`。也可用環境變數 `Agent__ShowThinkingProcess=true` 覆寫。
+
 ## 環境變數設定
 
 | 變數名稱 | 說明 | 範例 |
 |----------|------|------|
 | `OPENAI_API_KEY` | OpenAI 相容 API 密鑰 | `sk-your-key-here` |
-| `OPENAI_MODEL` | 使用的模型 | `qwen3-coder:30b` |
-| `OPENAI_BASE_URL` | API 端點 URL | `http://localhost:8080` |
+| `OPENAI_MODEL` | 使用的模型 | `gpt-oss:20b` |
+| `OPENAI_BASE_URL` | OpenAI 相容 API 端點 URL | `http://192.168.1.102:11434/v1` |
 | `SUPERAGENT_ENCRYPTION_KEY` | API 密鑰加密密鑰 | `your-encryption-key-32chars` |
 | `SUPERAGENT_API_KEY` | SuperAgent API 密鑰 | `superagent-key` |
 

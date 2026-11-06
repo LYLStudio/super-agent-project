@@ -2,6 +2,7 @@ using Xunit;
 using SuperAgent.Core;
 using System.Text.Json;
 using System.Threading;
+using System.Diagnostics;
 
 namespace SuperAgent.Core.Tests;
 
@@ -37,5 +38,38 @@ public class ToolRegistryTests
         
         // 清理測試檔案
         File.Delete("/tmp/test_output.txt");
+    }
+
+    [Fact]
+    public async Task ShellExecTool_DrainsLargeOutputWithoutHanging()
+    {
+        var tool = new ShellExecTool();
+        var arguments = JsonSerializer.SerializeToElement(new
+        {
+            command = "for i in {1..2000}; do printf '%080d\\n' \"$i\"; printf '%080d\\n' \"$i\" >&2; done"
+        });
+
+        var result = await tool.ExecuteAsync(arguments, CancellationToken.None);
+
+        Assert.Contains("STDOUT:", result);
+        Assert.Contains("STDERR:", result);
+        Assert.Contains("Exit code: 0", result);
+    }
+
+    [Fact]
+    public async Task ShellExecTool_StopsCommandWhenTimeoutExpires()
+    {
+        var tool = new ShellExecTool();
+        var arguments = JsonSerializer.SerializeToElement(new
+        {
+            command = "sleep 10",
+            timeout_seconds = 1
+        });
+        var stopwatch = Stopwatch.StartNew();
+
+        var result = await tool.ExecuteAsync(arguments, CancellationToken.None);
+
+        Assert.Contains("timed out after 1 seconds", result);
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(5));
     }
 }

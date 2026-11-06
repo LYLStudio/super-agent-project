@@ -47,11 +47,22 @@ public class IntegrationTests
         registry.Register(new CodeReaderTool());
 
         var agent = new AgentLoop(mockClient, registry);
+        ToolCall? startedToolCall = null;
+        (ToolCall ToolCall, string Result)? completedToolCall = null;
+        agent.ToolExecutionStarted += toolCall => startedToolCall = toolCall;
+        agent.ToolExecutionCompleted += (toolCall, result) => completedToolCall = (toolCall, result);
 
         // 執行需要工具的任務
         var result = await agent.RunAsync("請在 /tmp/test_integration.txt 裡寫入 Hello Integration", CancellationToken.None);
 
         Assert.True(result.Success);
+        Assert.NotNull(startedToolCall);
+        Assert.Equal("code_writer", startedToolCall.Name);
+        Assert.Equal("/tmp/test_integration.txt", startedToolCall.Arguments.GetProperty("file_path").GetString());
+        Assert.True(completedToolCall.HasValue);
+        var completed = completedToolCall.GetValueOrDefault();
+        Assert.Equal("code_writer", completed.ToolCall.Name);
+        Assert.Contains("Successfully wrote", completed.Result);
         // 驗證文件是否被寫入
         Assert.True(File.Exists("/tmp/test_integration.txt"));
         var content = await File.ReadAllTextAsync("/tmp/test_integration.txt");
