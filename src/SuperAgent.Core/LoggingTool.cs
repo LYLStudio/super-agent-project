@@ -5,9 +5,14 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using SuperAgent.Core;
 
 namespace SuperAgent.Core;
+
+public enum LogRollingInterval
+{
+    Day,
+    Hour
+}
 
 /// <summary>
 /// LoggingTool - 結構化日誌系統
@@ -23,6 +28,32 @@ public class LoggingTool : ITool
     private static readonly List<LogEntry> _logEntries = new();
     private static readonly object _lock = new();
     private static int _logCounter = 0;
+    private readonly bool _enabled;
+    private readonly string _logFilePath;
+    private readonly LogRollingInterval _rollingInterval;
+    private readonly long _fileSizeLimitBytes;
+
+    public LoggingTool(
+        bool enabled = true,
+        string? logFilePath = null,
+        LogRollingInterval rollingInterval = LogRollingInterval.Day,
+        long fileSizeLimitBytes = 10 * 1024 * 1024)
+    {
+        if (!Enum.IsDefined(rollingInterval))
+        {
+            throw new ArgumentOutOfRangeException(nameof(rollingInterval));
+        }
+
+        if (fileSizeLimitBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(fileSizeLimitBytes));
+        }
+
+        _enabled = enabled;
+        _logFilePath = Path.GetFullPath(logFilePath ?? Path.Combine("logs", "superagent.log"));
+        _rollingInterval = rollingInterval;
+        _fileSizeLimitBytes = fileSizeLimitBytes;
+    }
 
     public enum LogLevel
     {
@@ -34,7 +65,9 @@ public class LoggingTool : ITool
     }
 
     public string Name => "logging";
-    public string Description => "結構化日誌系統，支援多級別日誌記錄與查詢";
+    public string Description => _enabled
+        ? $"結構化日誌系統，支援多級別日誌記錄與查詢；日誌檔案依 {_rollingInterval} 輪替，大小上限 {_fileSizeLimitBytes / (1024 * 1024)} MiB。"
+        : "結構化日誌系統目前已停用；可查詢本次執行期間的記憶體日誌。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
@@ -50,6 +83,80 @@ public class LoggingTool : ITool
         },
         required = new[] { "action" }
     });
+
+    public IReadOnlyList<LogEntry> ReadRecentLogs(int limit = 50, string? query = null)
+    {
+        if (limit is < 1 or > MaximumQueryResults)
+        {
+            throw new ArgumentOutOfRangeException(nameof(limit), $"Limit must be between 1 and {MaximumQueryResults}.");
+        }
+
+        lock (_lock)
+        {
+            var directory = Path.GetDirectoryName(_logFilePath)!;
+            if (!Directory.Exists(directory))
+            {
+                return Array.Empty<LogEntry>();
+            }
+
+            var filePrefix = Path.GetFileNameWithoutExtension(_logFilePath) + "-";
+            var extension = Path.GetExtension(_logFilePath);
+            var files = Directory.EnumerateFiles(directory, $"{filePrefix}*{extension}")
+                .Select(path => (Path: path, Order: GetLogFileOrder(Path.GetFileNameWithoutExtension(path), filePrefix)))
+                .Where(file => file.Order is not null)
+                .OrderByDescending(file => file.Order!.Value.Period, StringComparer.Ordinal)
+                .ThenByDescending(file => file.Order!.Value.Segment);
+            var entries = new List<LogEntry>(limit);
+
+            foreach (var file in files)
+            {
+                var lines = File.ReadAllLines(file.Path);
+                for (var index = lines.Length - 1; index >= 0; index--)
+                {
+                    if (string.IsNullOrWhiteSpace(lines[index]))
+                    {
+                        continue;
+                    }
+
+                    var entry = JsonSerializer.Deserialize<LogEntry>(lines[index])
+                        ?? throw new InvalidDataException($"日誌檔案包含空白紀錄: {file.Path}");
+                    if (!string.IsNullOrEmpty(query) &&
+                        !entry.Message.Contains(query, StringComparison.OrdinalIgnoreCase) &&
+                        !entry.Source.Contains(query, StringComparison.OrdinalIgnoreCase) &&
+                        !entry.Level.Contains(query, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    entries.Add(entry);
+                    if (entries.Count == limit)
+                    {
+                        return entries;
+                    }
+                }
+            }
+
+            return entries;
+        }
+    }
+
+    private static (string Period, int Segment)? GetLogFileOrder(string fileName, string filePrefix)
+    {
+        var remainder = fileName[filePrefix.Length..];
+        var separator = remainder.LastIndexOf('.');
+        if (separator > 0 &&
+            int.TryParse(remainder[(separator + 1)..], out var segment))
+        {
+            return (remainder[..separator], segment);
+        }
+
+        return remainder.Length > 0 ? (remainder, 0) : null;
+    }
+
+    public string WriteApplicationEvent(string level, string message, string source)
+    {
+        return WriteLog(ParseLogLevel(level), message, source, echoToConsole: false);
+    }
 
     public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
     {
@@ -71,7 +178,7 @@ public class LoggingTool : ITool
         switch (action.ToLower())
         {
             case "write":
-                return WriteLog(level, message, source);
+                return WriteLog(level, message, source, echoToConsole: true);
             case "query":
                 return QueryLogs(query, limit);
             case "clear":
@@ -114,16 +221,22 @@ public class LoggingTool : ITool
         };
     }
 
-    private static string WriteLog(LogLevel level, string message, string source)
+    private string WriteLog(LogLevel level, string message, string source, bool echoToConsole)
     {
+        if (!_enabled)
+        {
+            return "ℹ️ 日誌記錄目前已停用，未寫入新日誌";
+        }
+
         lock (_lock)
         {
             var wasTruncated = message.Length > MaximumMessageCharacters ||
                                source.Length > MaximumSourceCharacters;
+            var timestamp = DateTime.UtcNow;
             var entry = new LogEntry
             {
-                Id = ++_logCounter,
-                Timestamp = DateTime.UtcNow.ToString("o"),
+                Id = _logCounter + 1,
+                Timestamp = timestamp.ToString("o"),
                 Level = level.ToString(),
                 Message = message.Length > MaximumMessageCharacters
                     ? message[..MaximumMessageCharacters]
@@ -133,28 +246,82 @@ public class LoggingTool : ITool
                     : source
             };
 
+            try
+            {
+                AppendLogFile(entry, timestamp);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                return $"❌ 無法寫入日誌檔案: {ex.Message}";
+            }
+
             _logEntries.Add(entry);
+            _logCounter = entry.Id;
             if (_logEntries.Count > MaximumStoredEntries)
             {
                 _logEntries.RemoveAt(0);
             }
 
-            // 輸出到控制台
-            var levelColor = level switch
+            if (echoToConsole)
             {
-                LogLevel.Debug => "\u001b[36m",      // Cyan
-                LogLevel.Info => "\u001b[32m",       // Green
-                LogLevel.Warning => "\u001b[33m",    // Yellow
-                LogLevel.Error => "\u001b[31m",      // Red
-                LogLevel.Critical => "\u001b[35m",   // Magenta
-                _ => "\u001b[0m"
-            };
+                var levelColor = level switch
+                {
+                    LogLevel.Debug => "\u001b[36m",
+                    LogLevel.Info => "\u001b[32m",
+                    LogLevel.Warning => "\u001b[33m",
+                    LogLevel.Error => "\u001b[31m",
+                    LogLevel.Critical => "\u001b[35m",
+                    _ => "\u001b[0m"
+                };
 
-            Console.WriteLine($"{levelColor}[{entry.Level}] {entry.Timestamp} [{entry.Source}] {entry.Message}\u001b[0m");
+                Console.WriteLine($"{levelColor}[{entry.Level}] {entry.Timestamp} [{entry.Source}] {entry.Message}\u001b[0m");
+            }
 
             var truncationNotice = wasTruncated ? "，超出長度的內容已截斷" : string.Empty;
             return $"✅ 日誌已記錄 (ID: {entry.Id}, 級別: {entry.Level}){truncationNotice}";
         }
+    }
+
+    private void AppendLogFile(LogEntry entry, DateTime timestamp)
+    {
+        var directory = Path.GetDirectoryName(_logFilePath);
+        if (string.IsNullOrEmpty(directory))
+        {
+            throw new InvalidOperationException("日誌檔案路徑必須包含目錄。");
+        }
+
+        Directory.CreateDirectory(directory);
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(entry) + Environment.NewLine);
+        for (var segment = 0; ; segment++)
+        {
+            var filePath = GetSegmentPath(timestamp, segment);
+            using var stream = new FileStream(
+                filePath,
+                FileMode.OpenOrCreate,
+                FileAccess.Write,
+                FileShare.Read);
+            if (stream.Length > 0 && stream.Length + bytes.Length > _fileSizeLimitBytes)
+            {
+                continue;
+            }
+
+            stream.Seek(0, SeekOrigin.End);
+            stream.Write(bytes);
+            stream.Flush();
+            return;
+        }
+    }
+
+    private string GetSegmentPath(DateTime timestamp, int segment)
+    {
+        var period = _rollingInterval == LogRollingInterval.Day
+            ? timestamp.ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture)
+            : timestamp.ToString("yyyyMMdd-HH", System.Globalization.CultureInfo.InvariantCulture);
+        var directory = Path.GetDirectoryName(_logFilePath)!;
+        var fileName = Path.GetFileNameWithoutExtension(_logFilePath);
+        var extension = Path.GetExtension(_logFilePath);
+        var segmentSuffix = segment == 0 ? string.Empty : $".{segment:000}";
+        return Path.Combine(directory, $"{fileName}-{period}{segmentSuffix}{extension}");
     }
 
     private static string QueryLogs(string query, int limit)
@@ -222,7 +389,7 @@ public class LoggingTool : ITool
             var count = _logEntries.Count;
             _logEntries.Clear();
             _logCounter = 0;
-            return $"✅ 已清除 {count} 條日誌";
+            return $"✅ 已清除 {count} 條本次執行記憶體日誌 (日誌檔保留)";
         }
     }
 

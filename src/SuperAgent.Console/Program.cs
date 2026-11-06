@@ -88,6 +88,14 @@ var workspaceRoot = Path.GetFullPath(
 var allowOutsideWorkspace = ReadBoolSetting("Agent:AllowOutsideWorkspace", false);
 var workspaceAccessPolicy = new WorkspaceAccessPolicy(workspaceRoot, allowOutsideWorkspace);
 var outsideWorkspaceCommandAccess = ReadOutsideWorkspaceCommandAccess();
+var loggingEnabled = ReadBoolSetting("Logging:Enabled", true);
+var loggingFilePath = configuration["Logging:Path"] ?? Path.Combine("logs", "superagent.log");
+var logRollingInterval = ReadLogRollingInterval();
+var loggingFileSizeLimitMb = ReadIntSetting("Logging:FileSizeLimitMB", 10);
+if (string.IsNullOrWhiteSpace(loggingFilePath) || loggingFileSizeLimitMb <= 0)
+{
+    throw new InvalidOperationException("設定 Logging:Path 不可為空，Logging:FileSizeLimitMB 必須大於 0。");
+}
 
 if (agentConfig.MaxIterations is < 1 or > 100)
 {
@@ -112,6 +120,7 @@ AnsiConsole.MarkupLine($"[bold]Show thinking process:[/] {agentConfig.ShowThinki
 AnsiConsole.MarkupLine($"[bold]Agent 工作區:[/] {Markup.Escape(workspaceAccessPolicy.WorkspaceRoot)}");
 AnsiConsole.MarkupLine($"[bold]允許工作區外存取:[/] {allowOutsideWorkspace}");
 AnsiConsole.MarkupLine($"[bold]工作區外命令存取:[/] {outsideWorkspaceCommandAccess}");
+AnsiConsole.MarkupLine($"[bold]日誌記錄:[/] {(loggingEnabled ? "啟用" : "停用")} ({Markup.Escape(loggingFilePath)}, {logRollingInterval}, {loggingFileSizeLimitMb} MiB)");
 AnsiConsole.MarkupLine("");
 
 using var client = new ReloadableAgentClient(new OpenAICompatClient(
@@ -122,7 +131,9 @@ using var client = new ReloadableAgentClient(new OpenAICompatClient(
 
 var registry = new ToolRegistry();
 var markdownRenderer = new MarkdownRenderer();
+var applicationLogger = CreateApplicationLogger();
 ApplyToolConfiguration();
+LogApplicationEvent("info", "Application started", "SuperAgent");
 
 var agent = new AgentLoop(client, registry, agentConfig);
 var promptHistory = new List<string>();
@@ -143,6 +154,7 @@ agent.ResponseChunkReceived += (iteration, chunk) =>
 };
 agent.ToolExecutionStarted += toolCall =>
 {
+    LogApplicationEvent("info", $"Tool started: {toolCall.Name}", "Agent");
     if (agentConfig.ShowThinkingProcess)
     {
         AnsiConsole.MarkupLine($"[bold yellow]▶ 執行工具: {Markup.Escape(toolCall.Name)}[/]");
@@ -155,6 +167,7 @@ agent.ToolExecutionStarted += toolCall =>
 };
 agent.ToolExecutionCompleted += (toolCall, result) =>
 {
+    LogApplicationEvent("info", $"Tool completed: {toolCall.Name}", "Agent");
     if (agentConfig.ShowThinkingProcess)
     {
         AnsiConsole.MarkupLine($"[bold magenta]工具結果: {Markup.Escape(toolCall.Name)}[/]");
@@ -166,7 +179,7 @@ while (true)
 {
     if (!Console.IsInputRedirected && !Console.IsOutputRedirected)
     {
-        AnsiConsole.MarkupLine("[grey]F2 設定 | F5 重新載入設定 | ↑/↓ 提示歷史[/]");
+        AnsiConsole.MarkupLine("[grey]F2 設定 | F3 查看日誌 | F5 重新載入設定 | ↑/↓ 提示歷史[/]");
     }
 
     AnsiConsole.Markup("[bold green]SuperAgent>[/] ");
@@ -181,6 +194,12 @@ while (true)
     if (promptResult.Shortcut == "reload")
     {
         ReloadConfiguration(announce: true);
+        continue;
+    }
+
+    if (promptResult.Shortcut == "logs")
+    {
+        ViewLogs();
         continue;
     }
 
@@ -209,7 +228,8 @@ while (true)
         AnsiConsole.MarkupLine("  - help: 顯示此訊息");
         AnsiConsole.MarkupLine("  - ↑/↓: 瀏覽已送出的提示歷史");
         AnsiConsole.MarkupLine("  - ←/→、Home/End: 移動游標");
-        AnsiConsole.MarkupLine("  - F2: 開啟常駐設定選單");
+        AnsiConsole.MarkupLine("  - F2: 開啟設定選單");
+        AnsiConsole.MarkupLine("  - F3: 查看日誌");
         AnsiConsole.MarkupLine("  - F5: 熱重載設定檔");
         AnsiConsole.MarkupLine("");
         AnsiConsole.MarkupLine("[bold]請直接輸入你的任務指令，Agent 將自動思考與執行。[/]");
@@ -224,7 +244,12 @@ while (true)
 
     try
     {
+        LogApplicationEvent("info", "Agent request started", "Agent");
         var result = await agent.RunAsync(input);
+        LogApplicationEvent(
+            result.Success ? "info" : "warning",
+            $"Agent request completed: success={result.Success}, state={result.FinalState}, iterations={result.TotalIterations}",
+            "Agent");
 
         AnsiConsole.MarkupLine($"[bold]狀態:[/] {result.FinalState}");
         AnsiConsole.MarkupLine($"[bold]迭代次數:[/] {result.TotalIterations}");
@@ -240,6 +265,7 @@ while (true)
     }
     catch (Exception ex)
     {
+        LogApplicationEvent("error", $"Agent request failed: {ex.GetType().Name}", "Agent");
         AnsiConsole.MarkupLine($"[red]發生錯誤:[/] {Markup.Escape(ex.Message)}");
         AnsiConsole.MarkupLine("");
     }
@@ -258,7 +284,11 @@ void ApplyToolConfiguration()
         new DebuggerTool(),
         new RefactoringTool(),
         new PerformanceMonitor(),
-        new LoggingTool(),
+        new LoggingTool(
+            loggingEnabled,
+            loggingFilePath,
+            logRollingInterval,
+            checked((long)loggingFileSizeLimitMb * 1024 * 1024)),
         new FileSearchTool(workspaceAccessPolicy),
         new ShellExecTool(
             workspaceAccessPolicy.WorkspaceRoot,
@@ -300,6 +330,24 @@ void ApplyToolConfiguration()
     }
 }
 
+LoggingTool CreateApplicationLogger()
+{
+    return new LoggingTool(
+        loggingEnabled,
+        loggingFilePath,
+        logRollingInterval,
+        checked((long)loggingFileSizeLimitMb * 1024 * 1024));
+}
+
+void LogApplicationEvent(string level, string message, string source)
+{
+    var result = applicationLogger.WriteApplicationEvent(level, message, source);
+    if (result.StartsWith("❌", StringComparison.Ordinal))
+    {
+        AnsiConsole.MarkupLine($"[red]應用程式日誌寫入失敗:[/] {Markup.Escape(result)}");
+    }
+}
+
 void ManageToolSettings()
 {
     var tools = GetToolChoices();
@@ -314,7 +362,7 @@ void ManageToolSettings()
         var selected = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("[bold]設定工具啟用狀態[/]")
-                .PageSize(16)
+                .PageSize(20)
                 .AddChoices(choices));
 
         if (selected == "返回設定")
@@ -381,7 +429,7 @@ async Task OpenSettingsMenuAsync()
         var setting = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("[bold]設定 (儲存後返回會立即套用)[/]")
-                .PageSize(16)
+                .PageSize(18)
                 .AddChoices(
                     "API 端點 URL",
                     "API 密鑰",
@@ -395,6 +443,9 @@ async Task OpenSettingsMenuAsync()
                     "Agent 工作區路徑",
                     "允許工作區外存取",
                     "工作區外命令存取",
+                    "日誌記錄啟用",
+                    "日誌切檔週期",
+                    "日誌檔案大小上限 (MiB)",
                     "管理工具啟用狀態",
                     "返回對話"));
 
@@ -423,6 +474,55 @@ async Task OpenSettingsMenuAsync()
         var updatedConfiguration = BuildConfiguration(fullConfigPath);
         (configuration as IDisposable)?.Dispose();
         configuration = updatedConfiguration;
+    }
+}
+
+void ViewLogs()
+{
+    var filter = AnsiConsole.Prompt(
+        new TextPrompt<string>("日誌篩選文字 (可留空):")
+            .AllowEmpty()
+            .DefaultValue(string.Empty));
+
+    try
+    {
+        var logReader = new LoggingTool(
+            loggingEnabled,
+            loggingFilePath,
+            logRollingInterval,
+            checked((long)loggingFileSizeLimitMb * 1024 * 1024));
+        var entries = logReader.ReadRecentLogs(limit: 50, query: filter);
+        if (entries.Count == 0)
+        {
+            AnsiConsole.MarkupLine("[yellow]找不到符合條件的日誌紀錄。[/]");
+            return;
+        }
+
+        var table = new Table()
+            .Border(TableBorder.Rounded)
+            .Title($"最近日誌 (顯示 {entries.Count} 筆，最多 50 筆)")
+            .AddColumn("UTC 時間")
+            .AddColumn("級別")
+            .AddColumn("來源")
+            .AddColumn("訊息");
+
+        foreach (var entry in entries)
+        {
+            var message = entry.Message.Length > 180
+                ? entry.Message[..177] + "..."
+                : entry.Message;
+            table.AddRow(
+                Markup.Escape(entry.Timestamp),
+                Markup.Escape(entry.Level),
+                Markup.Escape(entry.Source),
+                Markup.Escape(message));
+        }
+
+        AnsiConsole.Write(table);
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+    {
+        AnsiConsole.MarkupLine($"[red]讀取日誌失敗:[/] {Markup.Escape(ex.Message)}");
     }
 }
 
@@ -545,11 +645,17 @@ void ReloadConfiguration(bool announce)
         var nextMaxContextCharacters = ReadIntSetting("Agent:MaxContextCharacters", 32000);
         var nextTemperature = ReadDoubleSetting("Agent:Temperature", 0.7);
         var nextShowThinking = ReadBoolSetting("Agent:ShowThinkingProcess", false);
+        var nextLoggingEnabled = ReadBoolSetting("Logging:Enabled", true);
+        var nextLoggingFilePath = configuration["Logging:Path"] ?? Path.Combine("logs", "superagent.log");
+        var nextLogRollingInterval = ReadLogRollingInterval();
+        var nextLoggingFileSizeLimitMb = ReadIntSetting("Logging:FileSizeLimitMB", 10);
 
         if (nextTimeout <= 0 ||
             nextMaxIterations is < 1 or > 100 ||
             nextMaxTokens is < 1 or > 64000 ||
             nextMaxContextCharacters <= 0 ||
+            string.IsNullOrWhiteSpace(nextLoggingFilePath) ||
+            nextLoggingFileSizeLimitMb <= 0 ||
             !double.IsFinite(nextTemperature) ||
             nextTemperature is < 0 or > 2)
         {
@@ -579,6 +685,11 @@ void ReloadConfiguration(bool announce)
         allowOutsideWorkspace = nextAllowOutside;
         outsideWorkspaceCommandAccess = nextOutsideCommandAccess;
         workspaceAccessPolicy = nextWorkspacePolicy;
+        loggingEnabled = nextLoggingEnabled;
+        loggingFilePath = nextLoggingFilePath;
+        logRollingInterval = nextLogRollingInterval;
+        loggingFileSizeLimitMb = nextLoggingFileSizeLimitMb;
+        applicationLogger = CreateApplicationLogger();
         agentConfig.MaxIterations = nextMaxIterations;
         agentConfig.MaxTokens = nextMaxTokens;
         agentConfig.MaxContextCharacters = nextMaxContextCharacters;
@@ -587,12 +698,13 @@ void ReloadConfiguration(bool announce)
 
         ApplyToolConfiguration();
         client.Replace(nextClient);
+        LogApplicationEvent("info", "Configuration reloaded", "SuperAgent");
 
         (previousConfiguration as IDisposable)?.Dispose();
         if (announce)
         {
             AnsiConsole.MarkupLine("[green]設定已熱重載並套用至後續對話。[/]");
-            AnsiConsole.MarkupLine($"[grey]模型: {Markup.Escape(model)} | 工作區: {Markup.Escape(workspaceRoot)} | 檔案工作區外存取: {allowOutsideWorkspace} | 工作區外命令存取: {outsideWorkspaceCommandAccess}[/]");
+            AnsiConsole.MarkupLine($"[grey]模型: {Markup.Escape(model)} | 工作區: {Markup.Escape(workspaceRoot)} | 檔案工作區外存取: {allowOutsideWorkspace} | 工作區外命令存取: {outsideWorkspaceCommandAccess} | 日誌: {(loggingEnabled ? "啟用" : "停用")}[/]");
         }
     }
     catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or IOException or UnauthorizedAccessException or FormatException or ArgumentException)
@@ -649,6 +761,21 @@ bool ReadBoolSetting(string key, bool defaultValue)
     }
 
     throw new InvalidOperationException($"設定 {key} 的值 '{value}' 不是有效的布林值。");
+}
+
+LogRollingInterval ReadLogRollingInterval()
+{
+    var value = configuration["Logging:RollingInterval"];
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return LogRollingInterval.Day;
+    }
+
+    return value.Equals("Day", StringComparison.OrdinalIgnoreCase)
+        ? LogRollingInterval.Day
+        : value.Equals("Hour", StringComparison.OrdinalIgnoreCase)
+            ? LogRollingInterval.Hour
+            : throw new InvalidOperationException("設定 Logging:RollingInterval 必須是 Day 或 Hour。");
 }
 
 OutsideWorkspaceCommandAccess ReadOutsideWorkspaceCommandAccess()
@@ -756,6 +883,9 @@ Task<bool> ConfirmOutsideWorkspaceCommandAsync(string path, CancellationToken ca
             case ConsoleKey.F2:
                 Console.WriteLine();
                 return (null, "settings");
+            case ConsoleKey.F3:
+                Console.WriteLine();
+                return (null, "logs");
             case ConsoleKey.F5:
                 Console.WriteLine();
                 return (null, "reload");
@@ -912,6 +1042,9 @@ void EditConfigurationSetting(string path, string setting)
         "顯示處理過程" => ("Agent", "ShowThinkingProcess", "bool", "false"),
         "Agent 工作區路徑" => ("Agent", "WorkspaceRoot", "directory", Directory.GetCurrentDirectory()),
         "允許工作區外存取" => ("Agent", "AllowOutsideWorkspace", "bool", "false"),
+        "日誌記錄啟用" => ("Logging", "Enabled", "bool", "true"),
+        "日誌切檔週期" => ("Logging", "RollingInterval", "rollingInterval", "Day"),
+        "日誌檔案大小上限 (MiB)" => ("Logging", "FileSizeLimitMB", "positiveInt", "10"),
         _ => throw new ArgumentOutOfRangeException(nameof(setting), setting, "未知的設定項目。")
     };
 
@@ -944,6 +1077,14 @@ void EditConfigurationSetting(string path, string setting)
         }
 
         updatedValue = JsonValue.Create(value);
+    }
+    else if (type == "rollingInterval")
+    {
+        var selected = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title($"{Markup.Escape(setting)} (目前: {Markup.Escape(currentValue)})")
+                .AddChoices("每日切檔 (Day)", "每小時切檔 (Hour)"));
+        updatedValue = JsonValue.Create(selected == "每日切檔 (Day)" ? "Day" : "Hour");
     }
     else
     {
@@ -992,7 +1133,8 @@ void EditConfigurationSetting(string path, string setting)
                      {
                          "iterations" => integer is >= 1 and <= 100,
                          "tokens" => integer is >= 1 and <= 64000,
-                         _ => integer > 0
+                         "positiveInt" => integer > 0,
+                         _ => false
                      }))
             {
                 updatedValue = JsonValue.Create(integer);
