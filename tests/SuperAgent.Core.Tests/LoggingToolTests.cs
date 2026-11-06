@@ -147,4 +147,25 @@ public class LoggingToolTests
         Assert.NotNull(result);
         Assert.Contains("未知的日誌操作", result);
     }
+
+    [Fact]
+    public async Task LoggingTool_TruncatesOversizedMessagesAndRejectsLargeQueries()
+    {
+        LoggingTool.ClearAllLogs();
+        var tool = new LoggingTool();
+        var writeResult = await tool.ExecuteAsync(JsonSerializer.SerializeToElement(new
+        {
+            action = "write",
+            message = new string('x', 9000)
+        }), CancellationToken.None);
+        var queryResult = await tool.ExecuteAsync(JsonSerializer.SerializeToElement(new
+        {
+            action = "query",
+            limit = 201
+        }), CancellationToken.None);
+
+        Assert.Contains("超出長度的內容已截斷", writeResult);
+        Assert.Equal(8192, Assert.Single(LoggingTool.GetLogs()).Message.Length);
+        Assert.Contains("limit 必須介於", queryResult);
+    }
 }

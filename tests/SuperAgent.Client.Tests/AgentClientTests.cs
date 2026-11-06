@@ -112,6 +112,69 @@ public class AgentClientTests
         await Assert.ThrowsAsync<InvalidDataException>(() => client.GetAvailableModelsAsync());
     }
 
+    [Fact]
+    public async Task OpenAICompatClient_SerializesToolCallAndResultProtocolFields()
+    {
+        var handler = new ChatCompletionResponseHandler();
+        using var client = new OpenAICompatClient(
+            "http://localhost:11434/v1",
+            () => "test-key",
+            () => "test-model",
+            handler);
+        var request = new AgentRequest
+        {
+            Messages =
+            {
+                new ChatMessage { Role = "user", Content = "run tool" },
+                new ChatMessage
+                {
+                    Role = "assistant",
+                    ToolCalls =
+                    {
+                        new ToolCallDefinition
+                        {
+                            Id = "call-1",
+                            Name = "example",
+                            Arguments = JsonSerializer.SerializeToElement(new { value = 1 })
+                        }
+                    }
+                },
+                new ChatMessage { Role = "tool", Content = "result", ToolCallId = "call-1" }
+            }
+        };
+
+        await client.GetResponseAsync(request, CancellationToken.None);
+
+        var messages = handler.RequestBody!.RootElement.GetProperty("messages");
+        Assert.Equal("call-1", messages[1].GetProperty("tool_calls")[0].GetProperty("id").GetString());
+        Assert.Equal("call-1", messages[2].GetProperty("tool_call_id").GetString());
+        Assert.False(messages[0].TryGetProperty("tool_call_id", out _));
+    }
+
+    [Fact]
+    public void OpenAICompatClient_RejectsNonPositiveRequestTimeout()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OpenAICompatClient(
+            "http://localhost:11434/v1",
+            () => "test-key",
+            () => "test-model",
+            requestTimeout: TimeSpan.Zero));
+    }
+
+    [Fact]
+    public async Task OpenAICompatClient_AppliesConfiguredRequestTimeout()
+    {
+        using var client = new OpenAICompatClient(
+            "http://localhost:11434/v1",
+            () => "test-key",
+            () => "test-model",
+            new NeverCompletingResponseHandler(),
+            TimeSpan.FromMilliseconds(20));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.GetAvailableModelsAsync());
+    }
+
     private sealed class StreamingResponseHandler(string responseBody) : HttpMessageHandler
     {
         public HttpMethod? RequestMethod { get; private set; }
@@ -151,6 +214,36 @@ public class AgentClientTests
             {
                 Content = new StringContent(responseBody, Encoding.UTF8, "application/json")
             });
+        }
+    }
+
+    private sealed class ChatCompletionResponseHandler : HttpMessageHandler
+    {
+        public JsonDocument? RequestBody { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestBody = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"choices\":[{\"message\":{\"content\":\"done\"}}]}",
+                    Encoding.UTF8,
+                    "application/json")
+            };
+        }
+    }
+
+    private sealed class NeverCompletingResponseHandler : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK);
         }
     }
 }

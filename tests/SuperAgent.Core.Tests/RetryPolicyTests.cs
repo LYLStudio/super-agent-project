@@ -62,4 +62,23 @@ public class RetryPolicyTests
         Assert.Equal(2, result);
         Assert.Equal(2, attempts);
     }
+
+    [Fact]
+    public async Task RetryPolicy_DoesNotRetryCallerCancellation()
+    {
+        var policy = new RetryPolicy(maxRetries: 3, initialDelay: TimeSpan.Zero);
+        using var cancellationSource = new CancellationTokenSource();
+        var attempts = 0;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            policy.ExecuteAsync<int>(ct =>
+            {
+                attempts++;
+                cancellationSource.Cancel();
+                ct.ThrowIfCancellationRequested();
+                return Task.FromResult(0);
+            }, "TestOperation", cancellationSource.Token));
+
+        Assert.Equal(1, attempts);
+    }
 }

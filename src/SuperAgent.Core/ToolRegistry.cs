@@ -15,8 +15,13 @@ namespace SuperAgent.Core;
 /// </summary>
 public class ToolRegistry : IToolRegistry
 {
+    private const int MaximumCachedResults = 256;
     private readonly Dictionary<string, ITool> _tools = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _results = new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<string> _resultOrder = new();
+    private readonly Dictionary<string, LinkedListNode<string>> _resultNodes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _resultsLock = new();
+    private List<ToolDefinition> _toolDefinitions = new();
 
     /// <summary>
     /// 註冊工具
@@ -24,6 +29,30 @@ public class ToolRegistry : IToolRegistry
     public void Register(ITool tool)
     {
         _tools[tool.Name] = tool;
+        UpdateToolDefinitions();
+    }
+
+    public bool Unregister(string name)
+    {
+        var removed = _tools.Remove(name);
+        if (removed)
+        {
+            UpdateToolDefinitions();
+        }
+
+        return removed;
+    }
+
+    private void UpdateToolDefinitions()
+    {
+        _toolDefinitions = _tools.Values
+            .Select(t => new ToolDefinition
+            {
+                Name = t.Name,
+                Description = t.Description,
+                Parameters = t.Parameters.Clone()
+            })
+            .ToList();
     }
 
     /// <summary>
@@ -31,7 +60,7 @@ public class ToolRegistry : IToolRegistry
     /// </summary>
     public List<ToolDefinition> GetAllTools()
     {
-        return _tools.Values
+        return _toolDefinitions
             .Select(t => new ToolDefinition
             {
                 Name = t.Name,
@@ -57,9 +86,18 @@ public class ToolRegistry : IToolRegistry
     /// <summary>
     /// 取得最後一個工具呼叫的結果
     /// </summary>
-    public async Task<string?> GetLastResultAsync(string toolCallId)
+    public Task<string?> GetLastResultAsync(string toolCallId)
     {
-        return await Task.Run(() => _results.TryGetValue(toolCallId, out var result) ? result : null);
+        lock (_resultsLock)
+        {
+            _results.TryGetValue(toolCallId, out var result);
+            _results.Remove(toolCallId);
+            if (_resultNodes.Remove(toolCallId, out var node))
+            {
+                _resultOrder.Remove(node);
+            }
+            return Task.FromResult(result);
+        }
     }
 
     /// <summary>
@@ -67,7 +105,23 @@ public class ToolRegistry : IToolRegistry
     /// </summary>
     public void SetResult(string toolCallId, string result)
     {
-        _results[toolCallId] = result;
+        lock (_resultsLock)
+        {
+            if (!_results.ContainsKey(toolCallId))
+            {
+                var node = _resultOrder.AddLast(toolCallId);
+                _resultNodes.Add(toolCallId, node);
+            }
+            _results[toolCallId] = result;
+
+            while (_results.Count > MaximumCachedResults)
+            {
+                var oldest = _resultOrder.First!;
+                _resultOrder.RemoveFirst();
+                _resultNodes.Remove(oldest.Value);
+                _results.Remove(oldest.Value);
+            }
+        }
     }
 }
 
@@ -76,8 +130,17 @@ public class ToolRegistry : IToolRegistry
 /// </summary>
 public class CodeWriterTool : ITool
 {
+    private readonly WorkspaceAccessPolicy _accessPolicy;
+
+    public CodeWriterTool(WorkspaceAccessPolicy? accessPolicy = null)
+    {
+        _accessPolicy = accessPolicy ?? WorkspaceAccessPolicy.CreateUnrestrictedDefault();
+    }
+
     public string Name => "code_writer";
-    public string Description => "撰寫或覆寫程式碼文件。適用於建立新程式或修改現有程式。";
+    public string Description => _accessPolicy.AllowOutsideWorkspace
+        ? $"撰寫或覆寫程式碼文件。工作區根目錄：{_accessPolicy.WorkspaceRoot}。"
+        : $"在工作區內撰寫或覆寫程式碼文件。工作區根目錄：{_accessPolicy.WorkspaceRoot}；相對路徑以此為準。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
@@ -92,11 +155,12 @@ public class CodeWriterTool : ITool
 
     public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
     {
-        string filePath = arguments.GetProperty("file_path").GetString() ?? string.Empty;
+        string requestedPath = arguments.GetProperty("file_path").GetString() ?? string.Empty;
         string content = arguments.GetProperty("content").GetString() ?? string.Empty;
 
         try
         {
+            string filePath = _accessPolicy.ResolvePath(requestedPath);
             var directory = Path.GetDirectoryName(filePath);
             if (!string.IsNullOrEmpty(directory))
             {
@@ -118,8 +182,17 @@ public class CodeWriterTool : ITool
 /// </summary>
 public class CodeReaderTool : ITool
 {
+    private readonly WorkspaceAccessPolicy _accessPolicy;
+
+    public CodeReaderTool(WorkspaceAccessPolicy? accessPolicy = null)
+    {
+        _accessPolicy = accessPolicy ?? WorkspaceAccessPolicy.CreateUnrestrictedDefault();
+    }
+
     public string Name => "code_reader";
-    public string Description => "讀取程式碼文件內容。";
+    public string Description => _accessPolicy.AllowOutsideWorkspace
+        ? $"讀取程式碼文件內容。工作區根目錄：{_accessPolicy.WorkspaceRoot}。"
+        : $"讀取工作區內的程式碼文件。工作區根目錄：{_accessPolicy.WorkspaceRoot}；相對路徑以此為準。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
@@ -133,10 +206,11 @@ public class CodeReaderTool : ITool
 
     public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
     {
-        string filePath = arguments.GetProperty("file_path").GetString() ?? string.Empty;
+        string requestedPath = arguments.GetProperty("file_path").GetString() ?? string.Empty;
 
         try
         {
+            string filePath = _accessPolicy.ResolvePath(requestedPath);
             if (!File.Exists(filePath))
             {
                 return $"Error: File not found: {filePath}";
@@ -157,8 +231,27 @@ public class CodeReaderTool : ITool
 /// </summary>
 public class ShellExecTool : ITool
 {
+    private readonly WorkspaceAccessPolicy _accessPolicy;
+    private readonly OutsideWorkspaceCommandAccess _outsideWorkspaceAccess;
+    private readonly Func<string, CancellationToken, Task<bool>>? _confirmOutsideWorkspace;
+
+    public ShellExecTool(
+        string? workingDirectory = null,
+        OutsideWorkspaceCommandAccess outsideWorkspaceAccess = OutsideWorkspaceCommandAccess.Deny,
+        Func<string, CancellationToken, Task<bool>>? confirmOutsideWorkspace = null,
+        WorkspaceAccessPolicy? accessPolicy = null)
+    {
+        _accessPolicy = accessPolicy ?? WorkspaceAccessPolicy.CreateUnrestrictedDefault();
+        _outsideWorkspaceAccess = outsideWorkspaceAccess;
+        _confirmOutsideWorkspace = confirmOutsideWorkspace;
+        _defaultWorkingDirectory = workingDirectory ?? _accessPolicy.WorkspaceRoot;
+    }
+
+    private readonly string _defaultWorkingDirectory;
+
     public string Name => "shell_exec";
-    public string Description => "執行系統 shell 命令。";
+    public string Description =>
+        $"在 {_accessPolicy.WorkspaceRoot} 工作區執行 shell 命令。可選 working_directory 指定工作區子目錄；工作區外目錄政策為 {_outsideWorkspaceAccess}。Shell 命令本身仍可指定其他檔案路徑。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
@@ -166,7 +259,8 @@ public class ShellExecTool : ITool
         properties = new
         {
             command = new { type = "string", description = "要執行的 shell 命令" },
-            timeout_seconds = new { type = "number", description = "超時秒數，預設 30" }
+            timeout_seconds = new { type = "number", description = "超時秒數，預設 30" },
+            working_directory = new { type = "string", description = "命令工作目錄，預設為工作區根目錄；相對路徑以工作區為基準" }
         },
         required = new[] { "command" }
     });
@@ -180,6 +274,15 @@ public class ShellExecTool : ITool
 
         try
         {
+            var requestedWorkingDirectory = arguments.TryGetProperty("working_directory", out var workingDirectoryProperty)
+                ? workingDirectoryProperty.GetString()
+                : _defaultWorkingDirectory;
+            var workingDirectory = await _accessPolicy.ResolveCommandWorkingDirectoryAsync(
+                requestedWorkingDirectory,
+                _outsideWorkspaceAccess,
+                _confirmOutsideWorkspace,
+                cancellationToken);
+
             if (timeout <= 0)
             {
                 return "Error executing command: timeout_seconds must be greater than zero";
@@ -191,7 +294,8 @@ public class ShellExecTool : ITool
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                WorkingDirectory = workingDirectory
             };
             startInfo.ArgumentList.Add("-c");
             startInfo.ArgumentList.Add(command);
@@ -268,8 +372,21 @@ public class ShellExecTool : ITool
 /// </summary>
 public class FileSearchTool : ITool
 {
+    private const int DefaultMaxResults = 20;
+    private const int MaximumResults = 100;
+    private const int MaximumScannedFiles = 1000;
+    private const long MaximumFileBytes = 1_048_576;
+    private readonly WorkspaceAccessPolicy _accessPolicy;
+
+    public FileSearchTool(WorkspaceAccessPolicy? accessPolicy = null)
+    {
+        _accessPolicy = accessPolicy ?? WorkspaceAccessPolicy.CreateUnrestrictedDefault();
+    }
+
     public string Name => "file_search";
-    public string Description => "在檔案系統中搜尋檔案內容。支援關鍵字搜尋與路徑篩選。";
+    public string Description => _accessPolicy.AllowOutsideWorkspace
+        ? $"搜尋檔案內容，支援關鍵字與路徑篩選。工作區根目錄：{_accessPolicy.WorkspaceRoot}。"
+        : $"在工作區內搜尋檔案內容，支援關鍵字與路徑篩選。工作區根目錄：{_accessPolicy.WorkspaceRoot}；相對路徑以此為準。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
@@ -279,55 +396,100 @@ public class FileSearchTool : ITool
             directory = new { type = "string", description = "要搜尋的目錄路徑" },
             pattern = new { type = "string", description = "搜尋關鍵字或檔案模式" },
             file_extension = new { type = "string", description = "檔案副檔名（例如 .cs, .txt）" },
-            max_results = new { type = "number", description = "最大回傳結果數，預設 20" }
+            max_results = new { type = "integer", description = "最大回傳結果數，範圍 1 到 100 (預設 20)" }
         },
         required = new[] { "directory", "pattern" }
     });
 
     public async Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
     {
-        string directory = arguments.GetProperty("directory").GetString() ?? Directory.GetCurrentDirectory();
+        string requestedDirectory = arguments.GetProperty("directory").GetString() ?? _accessPolicy.WorkspaceRoot;
         string pattern = arguments.GetProperty("pattern").GetString() ?? string.Empty;
         string fileExtension = arguments.TryGetProperty("file_extension", out var extProp)
             ? extProp.GetString() ?? string.Empty
             : string.Empty;
-        int maxResults = arguments.TryGetProperty("max_results", out var maxProp)
-            ? (int)maxProp.GetDouble()
-            : 20;
+        int maxResults = DefaultMaxResults;
+        if (arguments.TryGetProperty("max_results", out var maxProp) &&
+            (!maxProp.TryGetInt32(out maxResults) || maxResults is < 1 or > MaximumResults))
+        {
+            return $"Error: max_results 必須介於 1 到 {MaximumResults}";
+        }
+
+        if (string.IsNullOrWhiteSpace(pattern))
+        {
+            return "Error: 搜尋關鍵字不能為空";
+        }
 
         try
         {
+            string directory = _accessPolicy.ResolvePath(requestedDirectory);
             if (!Directory.Exists(directory))
             {
                 return $"Error: Directory not found: {directory}";
             }
 
-            var files = Directory.GetFiles(directory, "*" + fileExtension, SearchOption.AllDirectories);
             var results = new List<string>();
+            var scannedFiles = 0;
+            var skippedFiles = 0;
+            var scanLimitReached = false;
+            var resultLimitReached = false;
 
-            foreach (var file in files)
+            foreach (var file in Directory.EnumerateFiles(directory, "*" + fileExtension, SearchOption.AllDirectories))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (scannedFiles == MaximumScannedFiles)
+                {
+                    scanLimitReached = true;
+                    break;
+                }
+
+                scannedFiles++;
                 try
                 {
+                    _accessPolicy.ResolvePath(file);
+                    if (new FileInfo(file).Length > MaximumFileBytes)
+                    {
+                        skippedFiles++;
+                        continue;
+                    }
+
                     var content = await File.ReadAllTextAsync(file, cancellationToken);
                     if (content.Contains(pattern, StringComparison.OrdinalIgnoreCase))
                     {
                         results.Add(file);
                         if (results.Count >= maxResults)
                         {
+                            resultLimitReached = true;
                             break;
                         }
                     }
                 }
-                catch
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    // 忽略無法讀取的文件
+                    throw;
+                }
+                catch (IOException)
+                {
+                    skippedFiles++;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    skippedFiles++;
                 }
             }
 
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"搜尋結果: {pattern}");
             sb.AppendLine($"找到 {results.Count} 個文件:");
+            sb.AppendLine($"已掃描 {scannedFiles} 個文件，略過 {skippedFiles} 個無法讀取或超過 1 MB 的文件。");
+            if (scanLimitReached)
+            {
+                sb.AppendLine($"已達到掃描上限 ({MaximumScannedFiles} 個文件)，結果可能不完整。");
+            }
+            if (resultLimitReached)
+            {
+                sb.AppendLine($"已達到結果上限 ({maxResults} 個文件)，可能還有符合結果未列出。");
+            }
             sb.AppendLine();
 
             foreach (var file in results)
@@ -336,6 +498,10 @@ public class FileSearchTool : ITool
             }
 
             return sb.ToString();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -349,8 +515,27 @@ public class FileSearchTool : ITool
 /// </summary>
 public class GitTool : ITool
 {
+    private readonly WorkspaceAccessPolicy _accessPolicy;
+    private readonly OutsideWorkspaceCommandAccess _outsideWorkspaceAccess;
+    private readonly Func<string, CancellationToken, Task<bool>>? _confirmOutsideWorkspace;
+
+    public GitTool(
+        string? workingDirectory = null,
+        OutsideWorkspaceCommandAccess outsideWorkspaceAccess = OutsideWorkspaceCommandAccess.Deny,
+        Func<string, CancellationToken, Task<bool>>? confirmOutsideWorkspace = null,
+        WorkspaceAccessPolicy? accessPolicy = null)
+    {
+        _accessPolicy = accessPolicy ?? WorkspaceAccessPolicy.CreateUnrestrictedDefault();
+        _outsideWorkspaceAccess = outsideWorkspaceAccess;
+        _confirmOutsideWorkspace = confirmOutsideWorkspace;
+        _defaultWorkingDirectory = workingDirectory ?? _accessPolicy.WorkspaceRoot;
+    }
+
+    private readonly string _defaultWorkingDirectory;
+
     public string Name => "git_tool";
-    public string Description => "執行 Git 版本控制命令。支援常見的 Git 操作。";
+    public string Description =>
+        $"在 {_accessPolicy.WorkspaceRoot} 工作區執行 Git 命令。可選 working_directory 指定工作區子目錄；工作區外目錄政策為 {_outsideWorkspaceAccess}。";
 
     public JsonElement Parameters => JsonSerializer.SerializeToElement(new
     {
@@ -358,7 +543,8 @@ public class GitTool : ITool
         properties = new
         {
             command = new { type = "string", description = "Git 命令 (例如 status, log, diff)" },
-            args = new { type = "string", description = "額外參數" }
+            args = new { type = "string", description = "額外參數" },
+            working_directory = new { type = "string", description = "Git 工作目錄，預設為工作區根目錄；相對路徑以工作區為基準" }
         },
         required = new[] { "command" }
     });
@@ -376,6 +562,22 @@ public class GitTool : ITool
         try
         {
             var fullCommand = $"git {command} {args}".Trim();
+            if (Regex.IsMatch(
+                    fullCommand,
+                    @"(?:^|\s)(?:-C\S*|--git-dir(?:=|\s|$)|--work-tree(?:=|\s|$))",
+                    RegexOptions.CultureInvariant))
+            {
+                return "Error: Git path override options (-C, --git-dir, --work-tree) are not supported; use working_directory instead.";
+            }
+
+            var requestedWorkingDirectory = arguments.TryGetProperty("working_directory", out var workingDirectoryProperty)
+                ? workingDirectoryProperty.GetString()
+                : _defaultWorkingDirectory;
+            var workingDirectory = await _accessPolicy.ResolveCommandWorkingDirectoryAsync(
+                requestedWorkingDirectory,
+                _outsideWorkspaceAccess,
+                _confirmOutsideWorkspace,
+                cancellationToken);
 
             var startInfo = new System.Diagnostics.ProcessStartInfo
             {
@@ -384,7 +586,8 @@ public class GitTool : ITool
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                WorkingDirectory = workingDirectory
             };
 
             System.Diagnostics.Process? process = System.Diagnostics.Process.Start(startInfo);
@@ -509,6 +712,10 @@ public class WebSearchTool : ITool
 
         try
         {
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+            using var searchCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                timeoutCts.Token);
             var searchAttempts = new List<string>();
             foreach (var provider in new[]
             {
@@ -522,10 +729,10 @@ public class WebSearchTool : ITool
                 using var response = await _httpClient.GetAsync(
                     requestUri,
                     HttpCompletionOption.ResponseHeadersRead,
-                    cancellationToken);
+                    searchCts.Token);
                 response.EnsureSuccessStatusCode();
 
-                var html = await response.Content.ReadAsStringAsync(cancellationToken);
+                var html = await response.Content.ReadAsStringAsync(searchCts.Token);
                 if (IsVerificationChallenge(provider.Name, html))
                 {
                     searchAttempts.Add($"{provider.Name} returned a verification challenge");

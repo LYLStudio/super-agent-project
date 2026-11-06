@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,6 +15,11 @@ namespace SuperAgent.Core;
 /// </summary>
 public class LoggingTool : ITool
 {
+    private const int MaximumStoredEntries = 1000;
+    private const int MaximumQueryResults = 200;
+    private const int MaximumQueryOutputCharacters = 20000;
+    private const int MaximumMessageCharacters = 8192;
+    private const int MaximumSourceCharacters = 256;
     private static readonly List<LogEntry> _logEntries = new();
     private static readonly object _lock = new();
     private static int _logCounter = 0;
@@ -40,7 +46,7 @@ public class LoggingTool : ITool
             message = new { type = "string", description = "日誌訊息內容" },
             source = new { type = "string", description = "日誌來源 (module/function)" },
             query = new { type = "string", description = "日誌查詢條件" },
-            limit = new { type = "integer", description = "查詢結果數量限制 (預設 50)" }
+            limit = new { type = "integer", description = "查詢結果數量限制 (預設 50，範圍 1 到 200)" }
         },
         required = new[] { "action" }
     });
@@ -53,6 +59,12 @@ public class LoggingTool : ITool
         var source = GetStringProperty(arguments, "source") ?? "unknown";
         var query = GetStringProperty(arguments, "query") ?? string.Empty;
         var limit = GetIntProperty(arguments, "limit", 50);
+
+        if (action.Equals("query", StringComparison.OrdinalIgnoreCase) &&
+            limit is < 1 or > MaximumQueryResults)
+        {
+            return $"❌ 查詢 limit 必須介於 1 到 {MaximumQueryResults}";
+        }
 
         var level = ParseLogLevel(levelStr);
 
@@ -106,16 +118,26 @@ public class LoggingTool : ITool
     {
         lock (_lock)
         {
+            var wasTruncated = message.Length > MaximumMessageCharacters ||
+                               source.Length > MaximumSourceCharacters;
             var entry = new LogEntry
             {
                 Id = ++_logCounter,
                 Timestamp = DateTime.UtcNow.ToString("o"),
                 Level = level.ToString(),
-                Message = message,
-                Source = source
+                Message = message.Length > MaximumMessageCharacters
+                    ? message[..MaximumMessageCharacters]
+                    : message,
+                Source = source.Length > MaximumSourceCharacters
+                    ? source[..MaximumSourceCharacters]
+                    : source
             };
 
             _logEntries.Add(entry);
+            if (_logEntries.Count > MaximumStoredEntries)
+            {
+                _logEntries.RemoveAt(0);
+            }
 
             // 輸出到控制台
             var levelColor = level switch
@@ -130,7 +152,8 @@ public class LoggingTool : ITool
 
             Console.WriteLine($"{levelColor}[{entry.Level}] {entry.Timestamp} [{entry.Source}] {entry.Message}\u001b[0m");
 
-            return $"✅ 日誌已記錄 (ID: {entry.Id}, 級別: {entry.Level})";
+            var truncationNotice = wasTruncated ? "，超出長度的內容已截斷" : string.Empty;
+            return $"✅ 日誌已記錄 (ID: {entry.Id}, 級別: {entry.Level}){truncationNotice}";
         }
     }
 
@@ -138,35 +161,57 @@ public class LoggingTool : ITool
     {
         lock (_lock)
         {
-            var filtered = _logEntries
-                .Where(e => string.IsNullOrEmpty(query) ||
-                            e.Message.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                            e.Source.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                            e.Level.Contains(query, StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(e => e.Timestamp)
-                .Take(limit)
-                .ToList();
+            const int reportOverhead = 128;
+            var details = new StringBuilder(Math.Min(MaximumQueryOutputCharacters, 4096));
+            var resultCount = 0;
+            var truncated = false;
+            for (var index = _logEntries.Count - 1; index >= 0; index--)
+            {
+                var entry = _logEntries[index];
+                if (!string.IsNullOrEmpty(query) &&
+                    !entry.Message.Contains(query, StringComparison.OrdinalIgnoreCase) &&
+                    !entry.Source.Contains(query, StringComparison.OrdinalIgnoreCase) &&
+                    !entry.Level.Contains(query, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (resultCount >= limit)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                var detail = $"{resultCount + 1}. [{entry.Id}] {entry.Timestamp} [{entry.Level}] [{entry.Source}]\n    {entry.Message}\n";
+                if (details.Length + detail.Length > MaximumQueryOutputCharacters - reportOverhead)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                details.Append(detail);
+                resultCount++;
+            }
 
             var lines = new List<string>();
             lines.Add("=== 日誌查詢結果 ===");
             lines.Add($"查詢條件: {query}");
-            lines.Add($"結果數量: {filtered.Count}");
+            lines.Add($"結果數量: {resultCount}");
             lines.Add("");
 
-            if (filtered.Count == 0)
+            if (resultCount == 0)
             {
                 lines.Add("未找到匹配的日誌");
                 return string.Join("\n", lines);
             }
 
-            for (int i = 0; i < filtered.Count; i++)
+            var result = string.Join("\n", lines) + "\n" + details;
+            if (truncated)
             {
-                var entry = filtered[i];
-                lines.Add($"{i + 1}. [{entry.Id}] {entry.Timestamp} [{entry.Level}] [{entry.Source}]");
-                lines.Add($"    {entry.Message}");
+                result += "查詢結果已達輸出上限，可能還有符合條件的日誌未列出。\n";
             }
 
-            return string.Join("\n", lines);
+            return result;
         }
     }
 
@@ -206,13 +251,31 @@ public class LoggingTool : ITool
 
     public static List<LogEntry> GetLogs()
     {
-        return new List<LogEntry>(_logEntries);
+        lock (_lock)
+        {
+            return _logEntries.Select(CloneLogEntry).ToList();
+        }
     }
 
     public static void ClearAllLogs()
     {
-        _logEntries.Clear();
-        _logCounter = 0;
+        lock (_lock)
+        {
+            _logEntries.Clear();
+            _logCounter = 0;
+        }
+    }
+
+    private static LogEntry CloneLogEntry(LogEntry entry)
+    {
+        return new LogEntry
+        {
+            Id = entry.Id,
+            Timestamp = entry.Timestamp,
+            Level = entry.Level,
+            Message = entry.Message,
+            Source = entry.Source
+        };
     }
 }
 

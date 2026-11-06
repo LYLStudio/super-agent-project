@@ -4,6 +4,7 @@ using System.IO;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using SuperAgent.Core;
@@ -15,12 +16,17 @@ namespace SuperAgent.Client;
 /// 支援 OpenAI 規格相容的 API 端點
 /// 支援 API 密鑰輪替與模型動態選擇
 /// </summary>
-public class OpenAICompatClient : IStreamingAgentClient
+public class OpenAICompatClient : IStreamingAgentClient, IDisposable
 {
+    private static readonly JsonSerializerOptions RequestJsonOptions = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
     private readonly HttpClient _httpClient;
     private readonly string _baseUrl;
     private readonly Func<string> _apiKeyProvider;
     private readonly Func<string> _modelProvider;
+    private readonly TimeSpan _requestTimeout;
 
     /// <summary>
     /// 建立 OpenAICompatClient
@@ -32,12 +38,20 @@ public class OpenAICompatClient : IStreamingAgentClient
         string baseUrl,
         Func<string> apiKeyProvider,
         Func<string> modelProvider,
-        HttpMessageHandler? httpMessageHandler = null)
+        HttpMessageHandler? httpMessageHandler = null,
+        TimeSpan? requestTimeout = null)
     {
         _baseUrl = baseUrl.TrimEnd('/');
         _apiKeyProvider = apiKeyProvider ?? throw new ArgumentNullException(nameof(apiKeyProvider));
         _modelProvider = modelProvider ?? throw new ArgumentNullException(nameof(modelProvider));
+        var timeout = requestTimeout ?? TimeSpan.FromSeconds(100);
+        if (timeout != Timeout.InfiniteTimeSpan && timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(requestTimeout), "Request timeout must be positive or infinite.");
+        }
+        _requestTimeout = timeout;
         _httpClient = new HttpClient(httpMessageHandler ?? new HttpClientHandler());
+        _httpClient.Timeout = timeout;
         _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_apiKeyProvider()}");
     }
 
@@ -50,7 +64,7 @@ public class OpenAICompatClient : IStreamingAgentClient
         var apiKey = _apiKeyProvider();
         var model = _modelProvider();
 
-        var json = JsonSerializer.Serialize(CreateRequestBody(request, model, stream: false));
+        var json = JsonSerializer.Serialize(CreateRequestBody(request, model, stream: false), RequestJsonOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions")
@@ -59,11 +73,11 @@ public class OpenAICompatClient : IStreamingAgentClient
         };
         httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
-        var response = await _httpClient.SendAsync(httpRequest, cancellationToken);
+        using var response = await _httpClient.SendAsync(httpRequest, cancellationToken);
         response.EnsureSuccessStatusCode();
 
         var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
-        var responseDoc = JsonDocument.Parse(responseJson);
+        using var responseDoc = JsonDocument.Parse(responseJson);
 
         var choice = responseDoc.RootElement.GetProperty("choices")[0];
         var message = choice.GetProperty("message");
@@ -110,6 +124,7 @@ public class OpenAICompatClient : IStreamingAgentClient
         }
 
         var names = new List<string>();
+        var uniqueNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var model in models.EnumerateArray())
         {
             var name = model.TryGetProperty("id", out var id)
@@ -117,8 +132,7 @@ public class OpenAICompatClient : IStreamingAgentClient
                 : model.TryGetProperty("name", out var modelName)
                     ? modelName.GetString()
                     : null;
-            if (!string.IsNullOrWhiteSpace(name) &&
-                !names.Contains(name, StringComparer.OrdinalIgnoreCase))
+            if (!string.IsNullOrWhiteSpace(name) && uniqueNames.Add(name))
             {
                 names.Add(name);
             }
@@ -132,9 +146,17 @@ public class OpenAICompatClient : IStreamingAgentClient
         Action<string>? onContentChunk,
         CancellationToken cancellationToken)
     {
+        using var timeoutCts = _requestTimeout == Timeout.InfiniteTimeSpan
+            ? null
+            : new CancellationTokenSource(_requestTimeout);
+        using var linkedCts = timeoutCts is null
+            ? null
+            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+        var requestToken = linkedCts?.Token ?? cancellationToken;
+
         var apiKey = _apiKeyProvider();
         var model = _modelProvider();
-        var json = JsonSerializer.Serialize(CreateRequestBody(request, model, stream: true));
+        var json = JsonSerializer.Serialize(CreateRequestBody(request, model, stream: true), RequestJsonOptions);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions")
         {
@@ -145,15 +167,15 @@ public class OpenAICompatClient : IStreamingAgentClient
         using var response = await _httpClient.SendAsync(
             httpRequest,
             HttpCompletionOption.ResponseHeadersRead,
-            cancellationToken);
+            requestToken);
         response.EnsureSuccessStatusCode();
 
-        await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        await using var responseStream = await response.Content.ReadAsStreamAsync(requestToken);
         using var reader = new StreamReader(responseStream);
         var responseContent = new StringBuilder();
         var toolCalls = new SortedDictionary<int, StreamedToolCall>();
 
-        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        while (await reader.ReadLineAsync(requestToken) is { } line)
         {
             if (!line.StartsWith("data:", StringComparison.Ordinal))
             {
@@ -243,6 +265,7 @@ public class OpenAICompatClient : IStreamingAgentClient
         {
             role = m.Role,
             content = m.Content,
+            tool_call_id = m.ToolCallId,
             tool_calls = m.ToolCalls.Count > 0 ? m.ToolCalls.Select(tc => new
             {
                 id = tc.Id,
@@ -283,6 +306,11 @@ public class OpenAICompatClient : IStreamingAgentClient
         public StringBuilder Name { get; } = new();
         public StringBuilder Arguments { get; } = new();
     }
+
+    public void Dispose()
+    {
+        _httpClient.Dispose();
+    }
 }
 
 /// <summary>
@@ -293,14 +321,16 @@ public static class OpenAICompatClientFactory
     /// <summary>
     /// 建立客戶端 (傳統模式，固定密鑰與模型)
     /// </summary>
-    public static IAgentClient Create(
+    public static OpenAICompatClient Create(
         string baseUrl,
         string apiKey,
-        string model = "gpt-oss:20b")
+        string model = "gpt-oss:20b",
+        TimeSpan? requestTimeout = null)
     {
         return new OpenAICompatClient(baseUrl,
             () => apiKey,
-            () => model);
+            () => model,
+            requestTimeout: requestTimeout);
     }
 
     /// <summary>
@@ -310,11 +340,12 @@ public static class OpenAICompatClientFactory
     /// <param name="apiKeyManager">API 密鑰管理器</param>
     /// <param name="modelSelector">模型選擇器</param>
     /// <param name="defaultModel">預設模型</param>
-    public static IAgentClient CreateWithKeyRotation(
+    public static OpenAICompatClient CreateWithKeyRotation(
         string baseUrl,
         ApiKeyManager apiKeyManager,
         ModelSelector? modelSelector = null,
-        string? defaultModel = "gpt-oss:20b")
+        string? defaultModel = "gpt-oss:20b",
+        TimeSpan? requestTimeout = null)
     {
         var defaultModelName = defaultModel ?? "gpt-oss:20b";
         var selector = modelSelector ?? new ModelSelector();
@@ -337,6 +368,7 @@ public static class OpenAICompatClientFactory
                 return string.IsNullOrWhiteSpace(defaultModel)
                     ? selector.GetDefaultModel()
                     : defaultModelName;
-            });
+            },
+            requestTimeout: requestTimeout);
     }
 }

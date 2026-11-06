@@ -73,7 +73,14 @@ public class ConversationStorage
         {
             var json = await File.ReadAllTextAsync(_storagePath, cancellationToken);
             var conversation = JsonSerializer.Deserialize<ConversationRecord>(json, _jsonOptions);
-            return conversation?.Messages;
+            return conversation is not null &&
+                   conversation.Id.Equals(conversationId, StringComparison.Ordinal)
+                ? conversation.Messages
+                : null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {

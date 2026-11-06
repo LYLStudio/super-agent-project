@@ -5,6 +5,7 @@ using BoxOfYellow.ConsoleMarkdownRenderer.Spectre;
 using Microsoft.Extensions.Configuration;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 var configPath = Environment.GetEnvironmentVariable("SUPERAGENT_CONFIG")
     ?? Path.Combine(AppContext.BaseDirectory, "appsettings.json");
@@ -37,7 +38,7 @@ if (args.Any(arg => arg.Equals("--help", StringComparison.OrdinalIgnoreCase) ||
 {
     AnsiConsole.MarkupLine("[bold]SuperAgent AI Agent CLI[/]");
     AnsiConsole.MarkupLine("");
-    AnsiConsole.MarkupLine("用法: SuperAgent [選項]");
+    AnsiConsole.WriteLine("用法: SuperAgent [選項]");
     AnsiConsole.MarkupLine("");
     AnsiConsole.MarkupLine("[bold]選項:[/]");
     AnsiConsole.MarkupLine("  --model=NAME  使用的模型名稱 (預設: gpt-oss:20b)");
@@ -50,11 +51,7 @@ if (args.Any(arg => arg.Equals("--help", StringComparison.OrdinalIgnoreCase) ||
 }
 
 var fullConfigPath = Path.GetFullPath(configPath);
-var configuration = new ConfigurationBuilder()
-    .SetBasePath(Path.GetDirectoryName(fullConfigPath)!)
-    .AddJsonFile(Path.GetFileName(fullConfigPath), optional: false, reloadOnChange: true)
-    .AddEnvironmentVariables()
-    .Build();
+IConfigurationRoot configuration = BuildConfiguration(fullConfigPath);
 
 var model = modelOverride
     ?? Environment.GetEnvironmentVariable("OPENAI_MODEL")
@@ -72,43 +69,10 @@ var apiKey = new[]
     configuration["OpenAI:ApiKey"]
 }.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "dummy";
 
-var modelCatalogClient = new OpenAICompatClient(baseUrl, () => apiKey, () => model);
-try
+var requestTimeoutSeconds = ReadIntSetting("OpenAI:RequestTimeoutSeconds", 120);
+if (requestTimeoutSeconds <= 0)
 {
-    var availableModels = await modelCatalogClient.GetAvailableModelsAsync();
-    if (availableModels.Count == 0)
-    {
-        AnsiConsole.MarkupLine("[yellow]模型 API 回傳空清單，將使用設定模型。[/]");
-    }
-    else if (!Console.IsInputRedirected)
-    {
-        var choices = new Dictionary<string, string>(StringComparer.Ordinal);
-        choices.Add($"保持目前設定 ({model})", model);
-        foreach (var availableModel in availableModels)
-        {
-            if (!choices.ContainsValue(availableModel))
-            {
-                choices.Add(availableModel, availableModel);
-            }
-        }
-
-        var selectedLabel = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("[bold]選擇推論模型[/]")
-                .PageSize(15)
-                .AddChoices(choices.Keys));
-        model = choices[selectedLabel];
-    }
-    else
-    {
-        AnsiConsole.MarkupLine(
-            $"[grey]已從推論 API 取得 {availableModels.Count} 個模型；非互動輸入，沿用設定模型。[/]");
-    }
-}
-catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException)
-{
-    AnsiConsole.MarkupLine(
-        $"[yellow]無法從推論 API 取得模型清單，沿用設定模型 '{Markup.Escape(model)}'。原因: {Markup.Escape(ex.Message)}[/]");
+    throw new InvalidOperationException("設定 OpenAI:RequestTimeoutSeconds 必須大於 0。");
 }
 
 var agentConfig = new AgentLoopConfig
@@ -116,79 +80,70 @@ var agentConfig = new AgentLoopConfig
     MaxIterations = ReadIntSetting("Agent:MaxIterations", 10),
     Temperature = ReadDoubleSetting("Agent:Temperature", 0.7),
     MaxTokens = ReadIntSetting("Agent:MaxTokens", 4000),
+    MaxContextCharacters = ReadIntSetting("Agent:MaxContextCharacters", 32000),
     ShowThinkingProcess = ReadBoolSetting("Agent:ShowThinkingProcess", false)
 };
+var workspaceRoot = Path.GetFullPath(
+    configuration["Agent:WorkspaceRoot"] ?? Directory.GetCurrentDirectory());
+var allowOutsideWorkspace = ReadBoolSetting("Agent:AllowOutsideWorkspace", false);
+var workspaceAccessPolicy = new WorkspaceAccessPolicy(workspaceRoot, allowOutsideWorkspace);
+var outsideWorkspaceCommandAccess = ReadOutsideWorkspaceCommandAccess();
 
-if (agentConfig.MaxIterations <= 0)
+if (agentConfig.MaxIterations is < 1 or > 100)
 {
-    throw new InvalidOperationException("設定 Agent:MaxIterations 必須大於 0。");
+    throw new InvalidOperationException("設定 Agent:MaxIterations 必須介於 1 到 100。");
 }
 
-if (agentConfig.MaxTokens <= 0)
+if (agentConfig.MaxTokens is < 1 or > 64000)
 {
-    throw new InvalidOperationException("設定 Agent:MaxTokens 必須大於 0。");
+    throw new InvalidOperationException("設定 Agent:MaxTokens 必須介於 1 到 64000。");
 }
 
-var apiKeyManager = new ApiKeyManager(Environment.GetEnvironmentVariable("SUPERAGENT_ENCRYPTION_KEY") ?? "default-encryption-key-0000000000000000");
-apiKeyManager.AddKey("configured-key", apiKey);
-var modelSelector = new ModelSelector();
+if (agentConfig.MaxContextCharacters <= 0)
+{
+    throw new InvalidOperationException("設定 Agent:MaxContextCharacters 必須大於 0。");
+}
 
-// 顯示 API 密鑰狀態
 AnsiConsole.MarkupLine("[bold]SuperAgent AI Agent CLI[/]");
 AnsiConsole.MarkupLine($"[bold]Model:[/] {model}");
 AnsiConsole.MarkupLine($"[bold]Endpoint:[/] {baseUrl}");
 AnsiConsole.MarkupLine($"[bold]Max iterations:[/] {agentConfig.MaxIterations}");
 AnsiConsole.MarkupLine($"[bold]Show thinking process:[/] {agentConfig.ShowThinkingProcess}");
-AnsiConsole.MarkupLine($"[bold]API 密鑰數量:[/] {apiKeyManager.KeyCount} (活用: {apiKeyManager.ActiveKeyCount})");
+AnsiConsole.MarkupLine($"[bold]Agent 工作區:[/] {Markup.Escape(workspaceAccessPolicy.WorkspaceRoot)}");
+AnsiConsole.MarkupLine($"[bold]允許工作區外存取:[/] {allowOutsideWorkspace}");
+AnsiConsole.MarkupLine($"[bold]工作區外命令存取:[/] {outsideWorkspaceCommandAccess}");
 AnsiConsole.MarkupLine("");
 
-// 建立支援密鑰輪替的客戶端
-var client = OpenAICompatClientFactory.CreateWithKeyRotation(
+using var client = new ReloadableAgentClient(new OpenAICompatClient(
     baseUrl,
-    apiKeyManager,
-    modelSelector,
-    model);
+    () => apiKey,
+    () => model,
+    requestTimeout: TimeSpan.FromSeconds(requestTimeoutSeconds)));
 
 var registry = new ToolRegistry();
 var markdownRenderer = new MarkdownRenderer();
-
-// 註冊預設工具
-registry.Register(new CodeWriterTool());
-registry.Register(new CodeReaderTool());
-registry.Register(new ShellExecTool());
-registry.Register(new DatabaseTool());
-registry.Register(new WebSearchTool());
-
-// Sprint 8: 新增程式碼分析與除錯工具
-registry.Register(new CodeAnalysisTool());
-registry.Register(new TestGeneratorTool());
-registry.Register(new DebuggerTool());
-
-// Sprint 9: 新增程式碼重構建議工具
-registry.Register(new RefactoringTool());
-
-// Sprint 10: 效能監控與日誌工具
-registry.Register(new PerformanceMonitor());
-registry.Register(new LoggingTool());
-
-// 工具註冊系統中定義但未註冊的工具
-registry.Register(new FileSearchTool());
-registry.Register(new GitTool());
+ApplyToolConfiguration();
 
 var agent = new AgentLoop(client, registry, agentConfig);
-if (agentConfig.ShowThinkingProcess)
+var promptHistory = new List<string>();
+var streamedIterations = new HashSet<int>();
+agent.ResponseChunkReceived += (iteration, chunk) =>
 {
-    var streamedIterations = new HashSet<int>();
-    agent.ResponseChunkReceived += (iteration, chunk) =>
+    if (!agentConfig.ShowThinkingProcess)
     {
-        if (streamedIterations.Add(iteration))
-        {
-            AnsiConsole.MarkupLine($"[bold cyan]模型處理過程 (串流，第 {iteration} 輪)[/]");
-        }
+        return;
+    }
 
-        AnsiConsole.Markup(Markup.Escape(chunk));
-    };
-    agent.ToolExecutionStarted += toolCall =>
+    if (streamedIterations.Add(iteration))
+    {
+        AnsiConsole.MarkupLine($"[bold cyan]模型處理過程 (串流，第 {iteration} 輪)[/]");
+    }
+
+    AnsiConsole.Markup(Markup.Escape(chunk));
+};
+agent.ToolExecutionStarted += toolCall =>
+{
+    if (agentConfig.ShowThinkingProcess)
     {
         AnsiConsole.MarkupLine($"[bold yellow]▶ 執行工具: {Markup.Escape(toolCall.Name)}[/]");
         AnsiConsole.MarkupLine("[yellow]實際參數:[/]");
@@ -196,18 +151,45 @@ if (agentConfig.ShowThinkingProcess)
         {
             WriteIndented = true
         }));
-    };
-    agent.ToolExecutionCompleted += (toolCall, result) =>
+    }
+};
+agent.ToolExecutionCompleted += (toolCall, result) =>
+{
+    if (agentConfig.ShowThinkingProcess)
     {
         AnsiConsole.MarkupLine($"[bold magenta]工具結果: {Markup.Escape(toolCall.Name)}[/]");
         AnsiConsole.WriteLine(result);
-    };
-}
+    }
+};
 
 while (true)
 {
+    if (!Console.IsInputRedirected && !Console.IsOutputRedirected)
+    {
+        AnsiConsole.MarkupLine("[grey]F2 設定 | F5 重新載入設定 | ↑/↓ 提示歷史[/]");
+    }
+
     AnsiConsole.Markup("[bold green]SuperAgent>[/] ");
-    var input = Console.ReadLine();
+    var promptResult = ReadPromptInput(promptHistory);
+    if (promptResult.Shortcut == "settings")
+    {
+        await OpenSettingsMenuAsync();
+        ReloadConfiguration(announce: true);
+        continue;
+    }
+
+    if (promptResult.Shortcut == "reload")
+    {
+        ReloadConfiguration(announce: true);
+        continue;
+    }
+
+    var input = promptResult.Input;
+
+    if (input is null)
+    {
+        break;
+    }
 
     if (string.IsNullOrWhiteSpace(input))
         continue;
@@ -225,12 +207,18 @@ while (true)
         AnsiConsole.MarkupLine("[bold]可用命令:[/]");
         AnsiConsole.MarkupLine("  - exit/quit/q: 結束程式");
         AnsiConsole.MarkupLine("  - help: 顯示此訊息");
+        AnsiConsole.MarkupLine("  - ↑/↓: 瀏覽已送出的提示歷史");
+        AnsiConsole.MarkupLine("  - ←/→、Home/End: 移動游標");
+        AnsiConsole.MarkupLine("  - F2: 開啟常駐設定選單");
+        AnsiConsole.MarkupLine("  - F5: 熱重載設定檔");
         AnsiConsole.MarkupLine("");
         AnsiConsole.MarkupLine("[bold]請直接輸入你的任務指令，Agent 將自動思考與執行。[/]");
         AnsiConsole.MarkupLine("");
         continue;
     }
 
+    promptHistory.Add(input);
+    streamedIterations.Clear();
     AnsiConsole.MarkupLine("[bold]正在處理任務...[/]");
     AnsiConsole.MarkupLine("");
 
@@ -254,6 +242,364 @@ while (true)
     {
         AnsiConsole.MarkupLine($"[red]發生錯誤:[/] {Markup.Escape(ex.Message)}");
         AnsiConsole.MarkupLine("");
+    }
+}
+
+void ApplyToolConfiguration()
+{
+    var tools = new List<ITool>
+    {
+        new CodeWriterTool(workspaceAccessPolicy),
+        new CodeReaderTool(workspaceAccessPolicy),
+        new DatabaseTool(),
+        new WebSearchTool(),
+        new CodeAnalysisTool(),
+        new TestGeneratorTool(),
+        new DebuggerTool(),
+        new RefactoringTool(),
+        new PerformanceMonitor(),
+        new LoggingTool(),
+        new FileSearchTool(workspaceAccessPolicy),
+        new ShellExecTool(
+            workspaceAccessPolicy.WorkspaceRoot,
+            outsideWorkspaceCommandAccess,
+            ConfirmOutsideWorkspaceCommandAsync,
+            workspaceAccessPolicy),
+        new GitTool(
+            workspaceAccessPolicy.WorkspaceRoot,
+            outsideWorkspaceCommandAccess,
+            ConfirmOutsideWorkspaceCommandAsync,
+            workspaceAccessPolicy)
+    };
+
+    var configuredTools = new List<ITool>();
+    foreach (var tool in tools)
+    {
+        var toolName = tool.Name;
+        var value = configuration[$"Agent:Tools:{toolName}"];
+        if (value is not null && !bool.TryParse(value, out _))
+        {
+            throw new InvalidOperationException($"設定 Agent:Tools:{toolName} 必須是布林值。");
+        }
+
+        var enabled = value is null || bool.Parse(value);
+        if (enabled)
+        {
+            configuredTools.Add(tool);
+        }
+    }
+
+    foreach (var tool in tools)
+    {
+        registry.Unregister(tool.Name);
+    }
+
+    foreach (var tool in configuredTools)
+    {
+        registry.Register(tool);
+    }
+}
+
+void ManageToolSettings()
+{
+    var tools = GetToolChoices();
+    while (true)
+    {
+        var choices = tools.Select(tool =>
+        {
+            var enabled = ReadToolEnabled(tool.Name);
+            var status = !enabled ? "停用" : "啟用";
+            return $"{tool.Label} ({status})";
+        }).Append("返回設定").ToList();
+        var selected = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("[bold]設定工具啟用狀態[/]")
+                .PageSize(16)
+                .AddChoices(choices));
+
+        if (selected == "返回設定")
+        {
+            return;
+        }
+
+        var selectedTool = tools.First(tool => selected.StartsWith(tool.Label + " (", StringComparison.Ordinal));
+        var nextEnabled = !ReadToolEnabled(selectedTool.Name);
+        SaveConfigurationValue(
+            fullConfigPath,
+            "Agent:Tools",
+            selectedTool.Name,
+            JsonValue.Create(nextEnabled));
+        AnsiConsole.MarkupLine(
+            $"[green]{Markup.Escape(selectedTool.Label)} 已{(nextEnabled ? "啟用" : "停用")}。[/]");
+        var previousConfiguration = configuration;
+        configuration = BuildConfiguration(fullConfigPath);
+        (previousConfiguration as IDisposable)?.Dispose();
+        ApplyToolConfiguration();
+    }
+}
+
+bool ReadToolEnabled(string toolName)
+{
+    var value = configuration[$"Agent:Tools:{toolName}"];
+    if (value is null)
+    {
+        return true;
+    }
+
+    if (bool.TryParse(value, out var enabled))
+    {
+        return enabled;
+    }
+
+    throw new InvalidOperationException($"設定 Agent:Tools:{toolName} 必須是布林值。");
+}
+
+IReadOnlyList<(string Name, string Label)> GetToolChoices()
+{
+    return
+    [
+        ("code_writer", "程式碼寫入"),
+        ("code_reader", "程式碼讀取"),
+        ("shell_exec", "Shell 命令"),
+        ("database_query", "資料庫查詢"),
+        ("web_search", "網路搜尋"),
+        ("code_analyzer", "程式碼分析"),
+        ("test_generator", "測試產生"),
+        ("debugger", "除錯"),
+        ("refactoring", "重構建議"),
+        ("performance_monitor", "效能監控"),
+        ("logging", "日誌"),
+        ("file_search", "檔案搜尋"),
+        ("git_tool", "Git")
+    ];
+}
+
+async Task OpenSettingsMenuAsync()
+{
+    while (true)
+    {
+        var setting = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("[bold]設定 (儲存後返回會立即套用)[/]")
+                .PageSize(16)
+                .AddChoices(
+                    "API 端點 URL",
+                    "API 密鑰",
+                    "模型名稱",
+                    "請求逾時秒數",
+                    "最大迭代次數",
+                    "Temperature",
+                    "最大輸出 Token",
+                    "上下文字元上限",
+                    "顯示處理過程",
+                    "Agent 工作區路徑",
+                    "允許工作區外存取",
+                    "工作區外命令存取",
+                    "管理工具啟用狀態",
+                    "返回對話"));
+
+        if (setting == "返回對話")
+        {
+            return;
+        }
+
+        if (setting == "模型名稱")
+        {
+            await SelectModelFromEndpointAsync();
+        }
+        else if (setting == "管理工具啟用狀態")
+        {
+            ManageToolSettings();
+        }
+        else if (setting == "工作區外命令存取")
+        {
+            EditOutsideWorkspaceCommandAccess();
+        }
+        else
+        {
+            EditConfigurationSetting(fullConfigPath, setting);
+        }
+
+        var updatedConfiguration = BuildConfiguration(fullConfigPath);
+        (configuration as IDisposable)?.Dispose();
+        configuration = updatedConfiguration;
+    }
+}
+
+async Task SelectModelFromEndpointAsync()
+{
+    var settings = BuildConfiguration(fullConfigPath);
+    try
+    {
+        var endpoint = baseUrlOverride
+            ?? Environment.GetEnvironmentVariable("OPENAI_BASE_URL")
+            ?? settings["OpenAI:BaseUrl"]
+            ?? "http://192.168.1.102:11434/v1";
+        var key = new[]
+        {
+            apiKeyOverride,
+            Environment.GetEnvironmentVariable("OPENAI_API_KEY"),
+            Environment.GetEnvironmentVariable("SUPERAGENT_API_KEY"),
+            settings["OpenAI:ApiKey"]
+        }.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "dummy";
+        var configuredModel = settings["OpenAI:Model"] ?? model;
+        var timeoutSeconds = int.TryParse(
+            settings["OpenAI:RequestTimeoutSeconds"],
+            NumberStyles.Integer,
+            CultureInfo.InvariantCulture,
+            out var configuredTimeout) && configuredTimeout > 0
+                ? Math.Min(configuredTimeout, 10)
+                : 10;
+
+        IReadOnlyList<string> availableModels;
+        using (var modelCatalogClient = new OpenAICompatClient(
+                   endpoint,
+                   () => key,
+                   () => configuredModel,
+                   requestTimeout: TimeSpan.FromSeconds(timeoutSeconds)))
+        {
+            availableModels = await modelCatalogClient.GetAvailableModelsAsync();
+        }
+
+        if (availableModels.Count == 0)
+        {
+            AnsiConsole.MarkupLine("[yellow]端點未回傳可用模型，改用手動輸入。[/]");
+            EditConfigurationSetting(fullConfigPath, "模型名稱");
+            return;
+        }
+
+        var choices = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var availableModel in availableModels)
+        {
+            var label = string.Equals(availableModel, configuredModel, StringComparison.OrdinalIgnoreCase)
+                ? $"{availableModel} (目前)"
+                : availableModel;
+            choices[label] = availableModel;
+        }
+
+        if (!availableModels.Contains(configuredModel, StringComparer.OrdinalIgnoreCase))
+        {
+            choices[$"{configuredModel} (目前，端點清單外)"] = configuredModel;
+        }
+
+        choices["手動輸入模型名稱…"] = string.Empty;
+        var selectedLabel = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title($"[bold]選擇模型[/] [grey]({Markup.Escape(endpoint)})[/]")
+                .PageSize(15)
+                .AddChoices(choices.Keys));
+        var selectedModel = choices[selectedLabel];
+
+        if (string.IsNullOrEmpty(selectedModel))
+        {
+            EditConfigurationSetting(fullConfigPath, "模型名稱");
+            return;
+        }
+
+        SaveConfigurationValue(fullConfigPath, "OpenAI", "Model", JsonValue.Create(selectedModel));
+        AnsiConsole.MarkupLine($"[green]已保存模型 {Markup.Escape(selectedModel)}。[/]");
+    }
+    catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException or OperationCanceledException or UriFormatException)
+    {
+        AnsiConsole.MarkupLine($"[yellow]無法從端點取得模型清單: {Markup.Escape(ex.Message)}[/]");
+        AnsiConsole.MarkupLine("[grey]改用手動輸入模型名稱。[/]");
+        EditConfigurationSetting(fullConfigPath, "模型名稱");
+    }
+    finally
+    {
+        (settings as IDisposable)?.Dispose();
+    }
+}
+
+void ReloadConfiguration(bool announce)
+{
+    var previousConfiguration = configuration;
+    var nextConfiguration = BuildConfiguration(fullConfigPath);
+    configuration = nextConfiguration;
+
+    try
+    {
+        var nextModel = modelOverride
+            ?? Environment.GetEnvironmentVariable("OPENAI_MODEL")
+            ?? configuration["OpenAI:Model"]
+            ?? "gpt-oss:20b";
+        var nextBaseUrl = baseUrlOverride
+            ?? Environment.GetEnvironmentVariable("OPENAI_BASE_URL")
+            ?? configuration["OpenAI:BaseUrl"]
+            ?? "http://192.168.1.102:11434/v1";
+        var nextApiKey = new[]
+        {
+            apiKeyOverride,
+            Environment.GetEnvironmentVariable("OPENAI_API_KEY"),
+            Environment.GetEnvironmentVariable("SUPERAGENT_API_KEY"),
+            configuration["OpenAI:ApiKey"]
+        }.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "dummy";
+        var nextTimeout = ReadIntSetting("OpenAI:RequestTimeoutSeconds", 120);
+        var nextWorkspaceRoot = Path.GetFullPath(
+            configuration["Agent:WorkspaceRoot"] ?? Directory.GetCurrentDirectory());
+        var nextAllowOutside = ReadBoolSetting("Agent:AllowOutsideWorkspace", false);
+        var nextOutsideCommandAccess = ReadOutsideWorkspaceCommandAccess();
+        var nextWorkspacePolicy = new WorkspaceAccessPolicy(nextWorkspaceRoot, nextAllowOutside);
+        var nextMaxIterations = ReadIntSetting("Agent:MaxIterations", 10);
+        var nextMaxTokens = ReadIntSetting("Agent:MaxTokens", 4000);
+        var nextMaxContextCharacters = ReadIntSetting("Agent:MaxContextCharacters", 32000);
+        var nextTemperature = ReadDoubleSetting("Agent:Temperature", 0.7);
+        var nextShowThinking = ReadBoolSetting("Agent:ShowThinkingProcess", false);
+
+        if (nextTimeout <= 0 ||
+            nextMaxIterations is < 1 or > 100 ||
+            nextMaxTokens is < 1 or > 64000 ||
+            nextMaxContextCharacters <= 0 ||
+            !double.IsFinite(nextTemperature) ||
+            nextTemperature is < 0 or > 2)
+        {
+            throw new InvalidOperationException("設定檔中有無效的逾時、Agent 參數或工作區設定。");
+        }
+
+        foreach (var tool in GetToolChoices())
+        {
+            var enabled = configuration[$"Agent:Tools:{tool.Name}"];
+            if (enabled is not null && !bool.TryParse(enabled, out _))
+            {
+                throw new InvalidOperationException($"設定 Agent:Tools:{tool.Name} 必須是布林值。");
+            }
+        }
+
+        var nextClient = new OpenAICompatClient(
+            nextBaseUrl,
+            () => apiKey,
+            () => model,
+            requestTimeout: TimeSpan.FromSeconds(nextTimeout));
+
+        model = nextModel;
+        baseUrl = nextBaseUrl;
+        apiKey = nextApiKey;
+        requestTimeoutSeconds = nextTimeout;
+        workspaceRoot = nextWorkspacePolicy.WorkspaceRoot;
+        allowOutsideWorkspace = nextAllowOutside;
+        outsideWorkspaceCommandAccess = nextOutsideCommandAccess;
+        workspaceAccessPolicy = nextWorkspacePolicy;
+        agentConfig.MaxIterations = nextMaxIterations;
+        agentConfig.MaxTokens = nextMaxTokens;
+        agentConfig.MaxContextCharacters = nextMaxContextCharacters;
+        agentConfig.Temperature = nextTemperature;
+        agentConfig.ShowThinkingProcess = nextShowThinking;
+
+        ApplyToolConfiguration();
+        client.Replace(nextClient);
+
+        (previousConfiguration as IDisposable)?.Dispose();
+        if (announce)
+        {
+            AnsiConsole.MarkupLine("[green]設定已熱重載並套用至後續對話。[/]");
+            AnsiConsole.MarkupLine($"[grey]模型: {Markup.Escape(model)} | 工作區: {Markup.Escape(workspaceRoot)} | 檔案工作區外存取: {allowOutsideWorkspace} | 工作區外命令存取: {outsideWorkspaceCommandAccess}[/]");
+        }
+    }
+    catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or IOException or UnauthorizedAccessException or FormatException or ArgumentException)
+    {
+        configuration = previousConfiguration;
+        (nextConfiguration as IDisposable)?.Dispose();
+        AnsiConsole.MarkupLine($"[red]設定重載失敗，保留目前設定: {Markup.Escape(ex.Message)}[/]");
     }
 }
 
@@ -303,4 +649,391 @@ bool ReadBoolSetting(string key, bool defaultValue)
     }
 
     throw new InvalidOperationException($"設定 {key} 的值 '{value}' 不是有效的布林值。");
+}
+
+OutsideWorkspaceCommandAccess ReadOutsideWorkspaceCommandAccess()
+{
+    var value = configuration["Agent:OutsideWorkspaceCommandAccess"];
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return OutsideWorkspaceCommandAccess.Deny;
+    }
+
+    if (Enum.TryParse<OutsideWorkspaceCommandAccess>(value, ignoreCase: true, out var access) &&
+        Enum.IsDefined(access))
+    {
+        return access;
+    }
+
+    throw new InvalidOperationException(
+        "設定 Agent:OutsideWorkspaceCommandAccess 必須是 Deny、Confirm 或 Allow。");
+}
+
+void EditOutsideWorkspaceCommandAccess()
+{
+    var selected = AnsiConsole.Prompt(
+        new SelectionPrompt<string>()
+            .Title($"工作區外命令存取 (目前: {outsideWorkspaceCommandAccess})")
+            .AddChoices(
+                "拒絕工作區外目錄 (Deny)",
+                "每次提示確認 (Confirm)",
+                "允許工作區外目錄 (Allow)"));
+    var value = selected switch
+    {
+        "拒絕工作區外目錄 (Deny)" => OutsideWorkspaceCommandAccess.Deny,
+        "每次提示確認 (Confirm)" => OutsideWorkspaceCommandAccess.Confirm,
+        "允許工作區外目錄 (Allow)" => OutsideWorkspaceCommandAccess.Allow,
+        _ => throw new InvalidOperationException("未知的工作區外命令存取模式。")
+    };
+
+    SaveConfigurationValue(
+        fullConfigPath,
+        "Agent",
+        "OutsideWorkspaceCommandAccess",
+        JsonValue.Create(value.ToString()));
+    outsideWorkspaceCommandAccess = value;
+    AnsiConsole.MarkupLine($"[green]工作區外命令存取已設為 {value}。[/]");
+}
+
+Task<bool> ConfirmOutsideWorkspaceCommandAsync(string path, CancellationToken cancellationToken)
+{
+    if (Console.IsInputRedirected || Console.IsOutputRedirected || cancellationToken.IsCancellationRequested)
+    {
+        return Task.FromResult(false);
+    }
+
+    var confirmed = AnsiConsole.Prompt(
+        new SelectionPrompt<string>()
+            .Title($"[yellow]命令要求使用工作區外目錄：{Markup.Escape(path)}。是否允許這次操作？[/]")
+            .AddChoices("拒絕", "允許這次操作"));
+    return Task.FromResult(confirmed == "允許這次操作");
+}
+
+(string? Input, string? Shortcut) ReadPromptInput(IReadOnlyList<string> history)
+{
+    if (Console.IsInputRedirected || Console.IsOutputRedirected)
+    {
+        return (Console.ReadLine(), null);
+    }
+
+    var buffer = new System.Text.StringBuilder();
+    var cursor = 0;
+    var historyIndex = history.Count;
+    var draft = string.Empty;
+    var previousDisplayWidth = 0;
+    Console.Write("\u001b[s");
+
+    void Redraw()
+    {
+        var value = buffer.ToString();
+        Console.Write("\u001b[u");
+        Console.Write(value);
+        var displayWidth = GetTerminalDisplayWidth(value);
+        if (previousDisplayWidth > displayWidth)
+        {
+            Console.Write(new string(' ', previousDisplayWidth - displayWidth));
+        }
+
+        previousDisplayWidth = displayWidth;
+        Console.Write("\u001b[u");
+        Console.Write(value.AsSpan(0, cursor));
+    }
+
+    while (true)
+    {
+        var key = Console.ReadKey(intercept: true);
+        var text = buffer.ToString();
+        var textElementStarts = StringInfo.ParseCombiningCharacters(text);
+        var keyHandled = true;
+
+        switch (key.Key)
+        {
+            case ConsoleKey.Enter:
+                Console.Write("\u001b[u");
+                Console.Write(buffer.ToString());
+                Console.WriteLine();
+                return (buffer.ToString(), null);
+            case ConsoleKey.F2:
+                Console.WriteLine();
+                return (null, "settings");
+            case ConsoleKey.F5:
+                Console.WriteLine();
+                return (null, "reload");
+            case ConsoleKey.LeftArrow:
+                for (var index = textElementStarts.Length - 1; index >= 0; index--)
+                {
+                    if (textElementStarts[index] < cursor)
+                    {
+                        cursor = textElementStarts[index];
+                        break;
+                    }
+                }
+                break;
+            case ConsoleKey.RightArrow:
+                cursor = textElementStarts.FirstOrDefault(start => start > cursor, buffer.Length);
+                break;
+            case ConsoleKey.UpArrow:
+                if (history.Count > 0 && historyIndex > 0)
+                {
+                    if (historyIndex == history.Count)
+                    {
+                        draft = text;
+                    }
+
+                    historyIndex--;
+                    buffer.Clear().Append(history[historyIndex]);
+                    cursor = buffer.Length;
+                }
+                break;
+            case ConsoleKey.DownArrow:
+                if (historyIndex < history.Count)
+                {
+                    historyIndex++;
+                    var replacement = historyIndex == history.Count ? draft : history[historyIndex];
+                    buffer.Clear().Append(replacement);
+                    cursor = buffer.Length;
+                }
+                break;
+            case ConsoleKey.Home:
+                cursor = 0;
+                break;
+            case ConsoleKey.End:
+                cursor = buffer.Length;
+                break;
+            case ConsoleKey.Backspace:
+                for (var index = textElementStarts.Length - 1; index >= 0; index--)
+                {
+                    if (textElementStarts[index] < cursor)
+                    {
+                        buffer.Remove(textElementStarts[index], cursor - textElementStarts[index]);
+                        cursor = textElementStarts[index];
+                        break;
+                    }
+                }
+                break;
+            case ConsoleKey.Delete:
+                var nextTextElement = textElementStarts.FirstOrDefault(start => start > cursor, buffer.Length);
+                if (nextTextElement > cursor)
+                {
+                    buffer.Remove(cursor, nextTextElement - cursor);
+                }
+                break;
+            default:
+                if (key.Modifiers.HasFlag(ConsoleModifiers.Control) && key.Key == ConsoleKey.A)
+                {
+                    cursor = 0;
+                }
+                else if (key.Modifiers.HasFlag(ConsoleModifiers.Control) && key.Key == ConsoleKey.E)
+                {
+                    cursor = buffer.Length;
+                }
+                else if (!char.IsControl(key.KeyChar))
+                {
+                    buffer.Insert(cursor, key.KeyChar);
+                    cursor++;
+                }
+                else
+                {
+                    keyHandled = false;
+                }
+                break;
+        }
+
+        if (keyHandled)
+        {
+            Redraw();
+        }
+    }
+}
+
+int GetTerminalDisplayWidth(string value)
+{
+    var width = 0;
+    var elements = StringInfo.GetTextElementEnumerator(value);
+    while (elements.MoveNext())
+    {
+        var elementWidth = 0;
+        foreach (var rune in elements.GetTextElement().EnumerateRunes())
+        {
+            var category = System.Text.Rune.GetUnicodeCategory(rune);
+            if (category is System.Globalization.UnicodeCategory.NonSpacingMark or
+                System.Globalization.UnicodeCategory.EnclosingMark or
+                System.Globalization.UnicodeCategory.Format)
+            {
+                continue;
+            }
+
+            elementWidth = Math.Max(elementWidth, IsWideTerminalRune(rune.Value) ? 2 : 1);
+        }
+
+        width += elementWidth;
+    }
+
+    return width;
+}
+
+bool IsWideTerminalRune(int value)
+{
+    return value is >= 0x1100 and <= 0x115F
+        or >= 0x2329 and <= 0x232A
+        or >= 0x2E80 and <= 0x303E
+        or >= 0x3040 and <= 0xA4CF
+        or >= 0xAC00 and <= 0xD7A3
+        or >= 0xF900 and <= 0xFAFF
+        or >= 0xFE10 and <= 0xFE19
+        or >= 0xFE30 and <= 0xFE6F
+        or >= 0xFF01 and <= 0xFF60
+        or >= 0xFFE0 and <= 0xFFE6
+        or >= 0x1F300 and <= 0x1FAFF
+        or >= 0x20000 and <= 0x3FFFD;
+}
+
+IConfigurationRoot BuildConfiguration(string path)
+{
+    return new ConfigurationBuilder()
+        .SetBasePath(Path.GetDirectoryName(path)!)
+        .AddJsonFile(Path.GetFileName(path), optional: false, reloadOnChange: true)
+        .AddEnvironmentVariables()
+        .Build();
+}
+
+void EditConfigurationSetting(string path, string setting)
+{
+    var (sectionName, key, type, defaultValue) = setting switch
+    {
+        "API 端點 URL" => ("OpenAI", "BaseUrl", "string", "http://192.168.1.102:11434/v1"),
+        "API 密鑰" => ("OpenAI", "ApiKey", "secret", "dummy"),
+        "模型名稱" => ("OpenAI", "Model", "string", "gpt-oss:20b"),
+        "請求逾時秒數" => ("OpenAI", "RequestTimeoutSeconds", "positiveInt", "120"),
+        "最大迭代次數" => ("Agent", "MaxIterations", "iterations", "10"),
+        "Temperature" => ("Agent", "Temperature", "temperature", "0.7"),
+        "最大輸出 Token" => ("Agent", "MaxTokens", "tokens", "4000"),
+        "上下文字元上限" => ("Agent", "MaxContextCharacters", "positiveInt", "32000"),
+        "顯示處理過程" => ("Agent", "ShowThinkingProcess", "bool", "false"),
+        "Agent 工作區路徑" => ("Agent", "WorkspaceRoot", "directory", Directory.GetCurrentDirectory()),
+        "允許工作區外存取" => ("Agent", "AllowOutsideWorkspace", "bool", "false"),
+        _ => throw new ArgumentOutOfRangeException(nameof(setting), setting, "未知的設定項目。")
+    };
+
+    var configurationFile = JsonNode.Parse(File.ReadAllText(path)) as JsonObject
+        ?? throw new InvalidDataException($"設定檔 '{path}' 必須是 JSON 物件。");
+    var section = GetOrCreateSection(configurationFile, sectionName);
+
+    var currentValue = section[key]?.ToString() ?? defaultValue;
+    JsonNode? updatedValue;
+
+    if (type == "bool")
+    {
+        var current = bool.TryParse(currentValue, out var parsed) && parsed;
+        var selected = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title($"{Markup.Escape(setting)} (目前: {(current ? "開啟" : "關閉")})")
+                .AddChoices("開啟", "關閉"));
+        updatedValue = JsonValue.Create(selected == "開啟");
+    }
+    else if (type == "secret")
+    {
+        var value = AnsiConsole.Prompt(
+            new TextPrompt<string>("輸入新的 API 密鑰 (留空保持不變):")
+                .AllowEmpty()
+                .Secret());
+        if (string.IsNullOrEmpty(value))
+        {
+            AnsiConsole.MarkupLine("[grey]密鑰未變更。[/]");
+            return;
+        }
+
+        updatedValue = JsonValue.Create(value);
+    }
+    else
+    {
+        while (true)
+        {
+            var prompt = type switch
+            {
+                "positiveInt" => $"{setting} (目前: {Markup.Escape(currentValue)}，需大於 0):",
+                "iterations" => $"{setting} (目前: {Markup.Escape(currentValue)}，範圍 1-100):",
+                "tokens" => $"{setting} (目前: {Markup.Escape(currentValue)}，範圍 1-64000):",
+                "temperature" => $"{setting} (目前: {Markup.Escape(currentValue)}，範圍 0-2):",
+                "directory" => $"{setting} (目前: {Markup.Escape(currentValue)}，必須是已存在的目錄):",
+                _ => $"{setting} (目前: {Markup.Escape(currentValue)}):"
+            };
+            var value = AnsiConsole.Prompt(new TextPrompt<string>(prompt).DefaultValue(currentValue));
+
+            if (type is "string" or "directory")
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    AnsiConsole.MarkupLine("[red]此設定不可為空。[/]");
+                    continue;
+                }
+
+                if (type == "directory" && !Directory.Exists(value))
+                {
+                    AnsiConsole.MarkupLine("[red]工作區目錄不存在，請輸入有效的目錄路徑。[/]");
+                    continue;
+                }
+
+                updatedValue = JsonValue.Create(type == "directory" ? Path.GetFullPath(value) : value);
+                break;
+            }
+
+            if (type == "temperature")
+            {
+                if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var temperature) &&
+                    double.IsFinite(temperature) && temperature is >= 0 and <= 2)
+                {
+                    updatedValue = JsonValue.Create(temperature);
+                    break;
+                }
+            }
+            else if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer) &&
+                     (type switch
+                     {
+                         "iterations" => integer is >= 1 and <= 100,
+                         "tokens" => integer is >= 1 and <= 64000,
+                         _ => integer > 0
+                     }))
+            {
+                updatedValue = JsonValue.Create(integer);
+                break;
+            }
+
+            AnsiConsole.MarkupLine("[red]輸入值無效，請依提示範圍重新輸入。[/]");
+        }
+    }
+
+    SaveConfigurationValue(path, sectionName, key, updatedValue);
+    AnsiConsole.MarkupLine($"[green]已保存 {Markup.Escape(setting)}。[/]");
+}
+
+void SaveConfigurationValue(string path, string sectionName, string key, JsonNode? value)
+{
+    var configurationFile = JsonNode.Parse(File.ReadAllText(path)) as JsonObject
+        ?? throw new InvalidDataException($"設定檔 '{path}' 必須是 JSON 物件。");
+    var pathSegments = sectionName.Split(':', StringSplitOptions.RemoveEmptyEntries)
+        .Append(key)
+        .ToArray();
+    var current = configurationFile;
+    foreach (var segment in pathSegments[..^1])
+    {
+        current = GetOrCreateSection(current, segment);
+    }
+
+    current[pathSegments[^1]] = value;
+    File.WriteAllText(
+        path,
+        configurationFile.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
+}
+
+JsonObject GetOrCreateSection(JsonObject configurationFile, string sectionName)
+{
+    var section = configurationFile[sectionName] switch
+    {
+        null => new JsonObject(),
+        JsonObject existingSection => existingSection,
+        _ => throw new InvalidDataException($"設定檔中的 '{sectionName}' 必須是 JSON 物件。")
+    };
+    configurationFile[sectionName] = section;
+    return section;
 }

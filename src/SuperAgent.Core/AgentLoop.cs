@@ -63,6 +63,7 @@ public class AgentLoopConfig
     public int MaxIterations { get; set; } = 10;
     public double Temperature { get; set; } = 0.7;
     public int MaxTokens { get; set; } = 4000;
+    public int MaxContextCharacters { get; set; } = 32000;
     public bool EnableToolChoice { get; set; } = true;
     public bool ShowThinkingProcess { get; set; }
 }
@@ -81,6 +82,7 @@ public class AgentLoop
     private readonly string? _conversationId;
     private readonly List<AgentMessage> _messages = new();
     private readonly PerformanceMonitor _performanceMonitor = new();
+    private bool _conversationInitialized;
 
     public event Action<int, AgentMessage>? ThinkingResponseReceived;
     public event Action<int, string>? ResponseChunkReceived;
@@ -116,32 +118,27 @@ public class AgentLoop
     /// </summary>
     public async Task<AgentLoopResult> RunAsync(string userInput, CancellationToken cancellationToken = default)
     {
-        // 載入歷史會話 (如果支援會話儲存)
-        if (_conversationStorage is not null && _conversationId is not null)
+        if (!_conversationInitialized)
         {
-            var historicalMessages = await _conversationStorage.LoadConversationAsync(_conversationId, cancellationToken);
-            if (historicalMessages != null && historicalMessages.Count > 0)
+            if (_conversationStorage is not null && _conversationId is not null)
             {
-                _messages.AddRange(historicalMessages);
+                var historicalMessages = await _conversationStorage.LoadConversationAsync(_conversationId, cancellationToken);
+                if (historicalMessages is not null)
+                {
+                    _messages.AddRange(historicalMessages);
+                }
             }
-            else
+
+            if (!_messages.Exists(message => message.Role.Equals("system", StringComparison.OrdinalIgnoreCase)))
             {
-                // 初始化系統訊息
-                _messages.Add(new AgentMessage
+                _messages.Insert(0, new AgentMessage
                 {
                     Role = "system",
                     Content = GetSystemPrompt()
                 });
             }
-        }
-        else
-        {
-            // 初始化系統訊息
-            _messages.Add(new AgentMessage
-            {
-                Role = "system",
-                Content = GetSystemPrompt()
-            });
+
+            _conversationInitialized = true;
         }
 
         // 加入使用者輸入
@@ -179,13 +176,16 @@ public class AgentLoop
                     }).ToList()
                 };
             }
-            catch
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // 重試失敗後，建立錯誤回應訊息
+                throw;
+            }
+            catch (Exception ex)
+            {
                 thoughtResponse = new AgentMessage
                 {
                     Role = "assistant",
-                    Content = $"錯誤: API 請求失敗後重試 {_config.MaxIterations} 次後仍然失敗。請檢查 API 端點與密鑰設定。",
+                    Content = $"錯誤: API 請求重試後仍然失敗。請檢查 API 端點與密鑰設定。詳細資訊: {ex.Message}",
                     ToolCalls = new List<ToolCall>()
                 };
             }
@@ -205,6 +205,8 @@ public class AgentLoop
 
             if (thoughtResponse.ToolCalls.Count > 0 && _config.EnableToolChoice)
             {
+                _messages.Add(thoughtResponse);
+
                 // 步驟 2: 規劃 - 決定哪些工具需要執行
                 state = AgentLoopState.Planning;
                 await ExecuteToolCallsAsync(thoughtResponse.ToolCalls, cancellationToken);
@@ -240,23 +242,30 @@ public class AgentLoop
             state = AgentLoopState.Failed;
         }
 
+        var finalContent = _messages.LastOrDefault()?.Content ?? string.Empty;
+
         // 儲存會話 (如果支援會話儲存)
         if (_conversationStorage is not null && _conversationId is not null)
         {
             try
             {
+                TrimConversationHistory();
                 await _conversationStorage.SaveConversationAsync(_conversationId, _messages, cancellationToken);
             }
-            catch
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // 會話儲存失敗不應中斷主流程
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[警告] 儲存會話失敗: {ex.Message}");
             }
         }
 
         return new AgentLoopResult
         {
             Success = state == AgentLoopState.Completed,
-            FinalContent = _messages.LastOrDefault()?.Content ?? string.Empty,
+            FinalContent = finalContent,
             Messages = _messages.ToList(),
             FinalState = state,
             Error = state == AgentLoopState.Failed ? "超過最大迭代次數" : null,
@@ -264,14 +273,151 @@ public class AgentLoop
         };
     }
 
+    private void TrimConversationHistory()
+    {
+        if (_config.MaxContextCharacters <= 0)
+        {
+            throw new InvalidOperationException("MaxContextCharacters must be greater than zero.");
+        }
+
+        var systemMessage = _messages.FirstOrDefault(message =>
+            message.Role.Equals("system", StringComparison.OrdinalIgnoreCase));
+        if (systemMessage is null)
+        {
+            return;
+        }
+
+        var turns = new List<List<AgentMessage>>();
+        List<AgentMessage>? currentTurn = null;
+        foreach (var message in _messages)
+        {
+            if (message.Role.Equals("system", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (currentTurn is null || message.Role.Equals("user", StringComparison.OrdinalIgnoreCase))
+            {
+                currentTurn = new List<AgentMessage>();
+                turns.Add(currentTurn);
+            }
+
+            currentTurn.Add(message);
+        }
+
+        if (turns.Count > 0)
+        {
+            TrimLatestTurn(turns[^1], _config.MaxContextCharacters - EstimateMessageSize(systemMessage));
+        }
+
+        var selectedTurns = new List<List<AgentMessage>>();
+        var usedCharacters = EstimateMessageSize(systemMessage);
+        var omittedTurns = 0;
+        for (var index = turns.Count - 1; index >= 0; index--)
+        {
+            var turn = turns[index];
+            var turnSize = turn.Sum(EstimateMessageSize);
+            if (selectedTurns.Count > 0 && usedCharacters + turnSize > _config.MaxContextCharacters)
+            {
+                omittedTurns = index + 1;
+                break;
+            }
+
+            selectedTurns.Add(turn);
+            usedCharacters += turnSize;
+        }
+
+        var hasDuplicateSystemMessages = _messages.Count(message =>
+            message.Role.Equals("system", StringComparison.OrdinalIgnoreCase)) > 1;
+        if (omittedTurns == 0 &&
+            usedCharacters <= _config.MaxContextCharacters &&
+            !hasDuplicateSystemMessages)
+        {
+            return;
+        }
+
+        selectedTurns.Reverse();
+        _messages.Clear();
+        _messages.Add(systemMessage);
+        foreach (var turn in selectedTurns)
+        {
+            _messages.AddRange(turn);
+        }
+
+        if (omittedTurns > 0 &&
+            !systemMessage.Content.Contains("較早的對話回合因上下文預算限制而省略", StringComparison.Ordinal))
+        {
+            systemMessage.Content += "\n\n較早的對話回合因上下文預算限制而省略。";
+        }
+    }
+
+    private static void TrimLatestTurn(List<AgentMessage> turn, int availableCharacters)
+    {
+        var excessCharacters = turn.Sum(EstimateMessageSize) - availableCharacters;
+        if (excessCharacters <= 0)
+        {
+            return;
+        }
+
+        const string truncationMarker = "\n[較早的訊息內容因上下文預算限制而截斷]";
+        foreach (var message in turn)
+        {
+            if (message.Role.Equals("user", StringComparison.OrdinalIgnoreCase) ||
+                message.Content.Length == 0)
+            {
+                continue;
+            }
+
+            var wasAlreadyTruncated = message.Content.EndsWith(truncationMarker, StringComparison.Ordinal);
+            var content = wasAlreadyTruncated
+                ? message.Content[..^truncationMarker.Length]
+                : message.Content;
+            if (!wasAlreadyTruncated && content.Length <= truncationMarker.Length)
+            {
+                continue;
+            }
+
+            var maxReduction = wasAlreadyTruncated
+                ? content.Length
+                : Math.Max(0, content.Length - truncationMarker.Length);
+            var reduction = Math.Min(excessCharacters, maxReduction);
+            var retainedLength = wasAlreadyTruncated
+                ? content.Length - reduction
+                : content.Length - reduction - truncationMarker.Length;
+            message.Content = content[..retainedLength] + truncationMarker;
+            excessCharacters -= reduction;
+            if (excessCharacters <= 0)
+            {
+                return;
+            }
+        }
+    }
+
+    private static int EstimateMessageSize(AgentMessage message)
+    {
+        var size = message.Role.Length + message.Content.Length + (message.Name?.Length ?? 0);
+        foreach (var toolCall in message.ToolCalls)
+        {
+            size += toolCall.Id.Length + toolCall.Name.Length;
+            if (toolCall.Arguments.ValueKind is not (JsonValueKind.Undefined or JsonValueKind.Null))
+            {
+                size += toolCall.Arguments.GetRawText().Length;
+            }
+        }
+
+        return size;
+    }
+
     private async Task<AgentMessage> GenerateResponseAsync(CancellationToken cts, int iteration)
     {
+        TrimConversationHistory();
         var request = new AgentRequest
         {
             Messages = _messages.Select(m => new ChatMessage
             {
                 Role = m.Role,
                 Content = m.Content,
+                ToolCallId = m.ToolCallId,
                 ToolCalls = m.ToolCalls?.Select(tc => new ToolCallDefinition
                 {
                     Id = tc.Id,
@@ -320,6 +466,10 @@ public class AgentLoop
                 var result = await _toolRegistry.ExecuteAsync(toolCall.Name, toolCall.Arguments, cts);
                 _toolRegistry.SetResult(toolCall.Id, result);
                 ToolExecutionCompleted?.Invoke(toolCall, result);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -373,6 +523,7 @@ public class ChatMessage
 {
     public string Role { get; set; } = string.Empty;
     public string Content { get; set; } = string.Empty;
+    public string? ToolCallId { get; set; }
     public List<ToolCallDefinition> ToolCalls { get; set; } = new();
 }
 

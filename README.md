@@ -45,7 +45,9 @@ dotnet build src/SuperAgent.Console/SuperAgent.Console.csproj -c Release
 dotnet run --project src/SuperAgent.Console -- --help
 ```
 
-互動啟動時，程式會向設定的 OpenAI 相容端點查詢 `/models`，並提供可用模型選單；非互動輸入時會沿用 `OpenAI.Model` 或 `OPENAI_MODEL`。Agent 的最終回答會以 Markdown 格式呈現。
+互動啟動會直接使用 `appsettings.json` 設定，不會在啟動時跳出模型選單。每次輸入提示前會顯示常駐快捷工具列：按 `F2` 開啟設定選單，選擇「模型名稱」會連線目前 API 端點的 `/models` 取得模型清單，選取後保存並在返回對話時套用；清單查詢失敗時可手動輸入模型。其他設定修改同樣保存至目前設定檔（可用 `--config=PATH` 指定），返回對話時立即套用；按 `F5` 可重新讀取外部修改的設定檔並熱重載，不需重啟。命令列參數與環境變數仍會覆蓋設定檔值；API 密鑰會以明文寫入設定檔，請妥善保護檔案權限。Agent 的最終回答會以 Markdown 格式呈現。
+
+Agent 對話輸入支援方向鍵編輯：按上／下鍵瀏覽本次執行期間已送出的提示，左右鍵移動游標，Home／End 移至行首／行尾；也支援 Backspace、Delete 與 Ctrl+A／Ctrl+E。游標會跟隨目前編輯位置顯示。
 
 `web_search` 工具會優先透過 Bing 搜尋即時網頁，遇到驗證頁或無法解析結果時會改用 DuckDuckGo，回傳標題、連結與搜尋摘要；不需要額外 API 金鑰，但執行環境必須能連線至網際網路。
 
@@ -74,7 +76,7 @@ SuperAgent 內建 14 個工具，可透過自然語言指令自動選擇與執�
 | `test_generator` | 測試生成工具 | 自動產生 xunit 單元測試 |
 | `debugger` | 除錯輔助工具 | 分析錯誤並提供修復建議 |
 | `refactoring` | 重構建議工具 | 提供命名、方法抽取、類別拆分建議 |
-| `performance_monitor` | 效能監控工具 | 記錄執行時間與資源使用量 |
+| `performance_monitor` | 複雜度分析工具 | 量測分析操作時間與程序記憶體；不會執行輸入程式碼 |
 | `logging` | 日誌工具 | 結構化多級別日誌記錄 |
 
 ## 使用情境示範
@@ -194,21 +196,20 @@ public class CalculatorTests
 
 ```bash
 # 在 CLI 中輸入
-監控 API 呼叫的執行時間，並記錄相關日誌
+分析程式碼片段的複雜度並記錄分析耗時
 ```
 
 **效能監控輸出**:
 ```
 === 效能監控報告 ===
-操作: api_call
-執行次數: 1
+操作: code_review
+分析次數: 1
+複雜度分數: 2
+注意: 時間指標量測的是複雜度分析操作，不代表輸入程式碼的實際執行效能。
 
-=== 時間效能指標 ===
-總執行時間: 45 ms
-平均執行時間: 45.00 ms
-
-=== 效能評估 ===
-⚠️ 可接受: 執行時間 10ms - 100ms
+=== 分析耗時指標 ===
+總分析時間: 0.123 ms
+平均分析時間: 0.123 ms
 ```
 
 **日誌記錄輸出**:
@@ -224,10 +225,32 @@ public class CalculatorTests
   "OpenAI": {
     "BaseUrl": "http://192.168.1.102:11434/v1",
     "ApiKey": "dummy",
-    "Model": "gpt-oss:20b"
+    "Model": "gpt-oss:20b",
+    "RequestTimeoutSeconds": 120
   },
   "Agent": {
-    "ShowThinkingProcess": false
+    "MaxIterations": 20,
+    "MaxTokens": 8000,
+    "MaxContextCharacters": 32000,
+    "ShowThinkingProcess": false,
+    "WorkspaceRoot": ".",
+    "AllowOutsideWorkspace": false,
+    "OutsideWorkspaceCommandAccess": "Deny",
+    "Tools": {
+      "code_writer": true,
+      "code_reader": true,
+      "shell_exec": true,
+      "database_query": true,
+      "web_search": true,
+      "code_analyzer": true,
+      "test_generator": true,
+      "debugger": true,
+      "refactoring": true,
+      "performance_monitor": true,
+      "logging": true,
+      "file_search": true,
+      "git_tool": true
+    }
   },
   "Logging": {
     "Level": "Info",
@@ -237,7 +260,11 @@ public class CalculatorTests
 ```
 
 `appsettings.json` 會隨建置與發布複製到輸出目錄；程式預設從該設定檔讀取連線資訊。環境變數與命令列參數可覆寫設定值。
+`Agent.WorkspaceRoot` 定義 Agent 工作區根目錄，預設為啟動程式時的目前目錄。`Agent.AllowOutsideWorkspace` 預設為 `false`，控制檔案讀取、寫入和搜尋是否能存取工作區外路徑。Shell/Git 工具只由 `Agent.Tools.shell_exec` 和 `Agent.Tools.git_tool` 個別開關控制，預設可在工作區根目錄與其子目錄執行。
+`Agent.OutsideWorkspaceCommandAccess` 控制 Shell/Git 的 `working_directory` 指向工作區外目錄時的行為，支援 `Deny`（預設拒絕）、`Confirm`（互動時每次詢問，非互動模式一律拒絕）及 `Allow`。`working_directory` 未指定時使用工作區根目錄；相對路徑以工作區根目錄為基準。可在對話按 `F2` →「工作區外命令存取」修改此設定。這項政策限制工具設定的工作目錄，不是完整命令沙箱：Shell 命令本身仍可切換目錄或存取其他路徑；Git 工具會拒絕 `-C`、`--git-dir` 和 `--work-tree` 路徑覆寫選項。啟用命令工具前請確認 Agent 指令與模型可信。
+可在 `Agent.Tools` 以工具名稱設定個別工具是否啟用，未指定時預設啟用。也可在對話按 `F2` →「管理工具啟用狀態」切換；設定會保存並立即更新工具清單。
 將 `Agent.ShowThinkingProcess` 設為 `true` 可串流顯示模型輸出的處理訊息，並列出工具呼叫的實際參數與執行結果；模型處理訊息以青色、工具呼叫與結果以黃色／紫紅色、最終回答以綠色區分。此處顯示的是模型輸出的訊息，不是隱藏的內部推理內容。預設為 `false`。也可用環境變數 `Agent__ShowThinkingProcess=true` 覆寫。
+每個模型請求逾時預設為 120 秒，可透過 `OpenAI__RequestTimeoutSeconds` 設定。非互動模式不會在啟動時查詢模型清單；互動模式的模型選擇查詢最多等待 10 秒，失敗時會沿用設定模型。Agent 每回合最多 20 次迭代，對話上下文軟預算預設為 32000 字元（保留最新完整回合、裁切較長的非使用者訊息，較早回合超出預算時省略）。檔案搜尋最多掃描 1000 個檔案、略過大於 1 MiB 的檔案；資料庫回傳預設限制為 100 列／20000 字元，超過時會提示截斷。
 
 ## 環境變數設定
 
@@ -246,6 +273,11 @@ public class CalculatorTests
 | `OPENAI_API_KEY` | OpenAI 相容 API 密鑰 | `sk-your-key-here` |
 | `OPENAI_MODEL` | 使用的模型 | `gpt-oss:20b` |
 | `OPENAI_BASE_URL` | OpenAI 相容 API 端點 URL | `http://192.168.1.102:11434/v1` |
+| `OpenAI__RequestTimeoutSeconds` | API 請求逾時秒數 | `120` |
+| `Agent__MaxContextCharacters` | 對話上下文預算字元數 | `32000` |
+| `Agent__WorkspaceRoot` | Agent 工作區根目錄 | `.` |
+| `Agent__AllowOutsideWorkspace` | 是否允許檔案工具存取工作區外路徑 | `false` |
+| `Agent__OutsideWorkspaceCommandAccess` | Shell/Git 工作目錄在工作區外時的政策：`Deny`、`Confirm` 或 `Allow` | `Deny` |
 | `SUPERAGENT_ENCRYPTION_KEY` | API 密鑰加密密鑰 | `your-encryption-key-32chars` |
 | `SUPERAGENT_API_KEY` | SuperAgent API 密鑰 | `superagent-key` |
 

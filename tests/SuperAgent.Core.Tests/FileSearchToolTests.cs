@@ -52,4 +52,20 @@ public class FileSearchToolTests
         Assert.NotNull(result);
         Assert.False(string.IsNullOrEmpty(result));
     }
+
+    [Fact]
+    public async Task FileSearchTool_RejectsInvalidResultLimits()
+    {
+        var tool = new FileSearchTool();
+        var args = JsonSerializer.SerializeToElement(new
+        {
+            directory = "src",
+            pattern = "using",
+            max_results = 101
+        });
+
+        var result = await tool.ExecuteAsync(args, CancellationToken.None);
+
+        Assert.Contains("max_results 必須介於", result);
+    }
 }

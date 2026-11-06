@@ -44,6 +44,10 @@ public class RetryPolicy
             {
                 return await operation(cancellationToken);
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 lastException = ex;

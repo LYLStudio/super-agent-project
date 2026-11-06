@@ -40,6 +40,7 @@ public class AgentLoopTests
         Assert.Equal(10, config.MaxIterations);
         Assert.Equal(0.7, config.Temperature, 0.001);
         Assert.Equal(4000, config.MaxTokens);
+        Assert.Equal(32000, config.MaxContextCharacters);
         Assert.True(config.EnableToolChoice);
         Assert.False(config.ShowThinkingProcess);
     }
@@ -67,5 +68,148 @@ public class AgentLoopTests
         var thinkingResponse = Assert.Single(thinkingResponses);
         Assert.Equal(1, thinkingResponse.Iteration);
         Assert.Contains("測試顯示思考過程", thinkingResponse.Response.Content);
+    }
+
+    [Fact]
+    public async Task AgentLoop_SendsAssistantToolCallsBeforeToolResults()
+    {
+        var client = new RecordingAgentClient(returnToolCallFirst: true);
+        var registry = new ToolRegistry();
+        registry.Register(new FixedResultTool());
+        var agent = new AgentLoop(client, registry);
+
+        var result = await agent.RunAsync("run the tool");
+
+        Assert.True(result.Success);
+        var followUpRequest = client.Requests[1];
+        var assistantMessage = Assert.Single(followUpRequest.Messages.Where(message => message.Role == "assistant"));
+        var toolCall = Assert.Single(assistantMessage.ToolCalls);
+        Assert.Equal("call-1", toolCall.Id);
+        var toolMessage = Assert.Single(followUpRequest.Messages.Where(message => message.Role == "tool"));
+        Assert.Equal(toolCall.Id, toolMessage.ToolCallId);
+        Assert.Equal("tool result", toolMessage.Content);
+    }
+
+    [Fact]
+    public async Task AgentLoop_ReusesSystemPromptAcrossRuns()
+    {
+        var client = new RecordingAgentClient();
+        var agent = new AgentLoop(client, new ToolRegistry());
+
+        await agent.RunAsync("first task");
+        await agent.RunAsync("second task");
+
+        var secondRequest = client.Requests[1];
+        Assert.Single(secondRequest.Messages.Where(message => message.Role == "system"));
+        Assert.Equal(2, secondRequest.Messages.Count(message => message.Role == "user"));
+    }
+
+    [Fact]
+    public async Task AgentLoop_TrimsOlderTurnsToContextBudget()
+    {
+        var client = new RecordingAgentClient();
+        var agent = new AgentLoop(client, new ToolRegistry(), new AgentLoopConfig
+        {
+            MaxContextCharacters = 1200
+        });
+
+        await agent.RunAsync(new string('a', 600));
+        await agent.RunAsync(new string('b', 600));
+
+        var secondRequest = client.Requests[1];
+        Assert.Single(secondRequest.Messages.Where(message => message.Role == "user"));
+        Assert.Contains("較早的對話回合因上下文預算限制而省略",
+            Assert.Single(secondRequest.Messages.Where(message => message.Role == "system")).Content);
+    }
+
+    [Fact]
+    public async Task AgentLoop_TruncatesToolOutputWithoutBreakingToolCallPair()
+    {
+        var client = new RecordingAgentClient(returnToolCallFirst: true);
+        var registry = new ToolRegistry();
+        registry.Register(new FixedResultTool(new string('x', 5000)));
+        var agent = new AgentLoop(client, registry, new AgentLoopConfig
+        {
+            MaxContextCharacters = 1200
+        });
+
+        await agent.RunAsync("run the tool");
+
+        var followUpRequest = client.Requests[1];
+        var toolCallMessage = Assert.Single(followUpRequest.Messages.Where(message =>
+            message.Role == "assistant" && message.ToolCalls.Count > 0));
+        var toolMessage = Assert.Single(followUpRequest.Messages.Where(message => message.Role == "tool"));
+        Assert.Equal(Assert.Single(toolCallMessage.ToolCalls).Id, toolMessage.ToolCallId);
+        Assert.Contains("因上下文預算限制而截斷", toolMessage.Content);
+        var estimatedSize = followUpRequest.Messages.Sum(message =>
+            message.Content.Length + message.ToolCalls.Sum(call => call.Arguments.GetRawText().Length));
+        Assert.True(estimatedSize <= 1200);
+    }
+
+    [Fact]
+    public async Task AgentLoop_LoadsPersistedConversationOnlyOnce()
+    {
+        var storagePath = Path.Combine(Path.GetTempPath(), $"superagent-{Guid.NewGuid():N}.json");
+        try
+        {
+            var storage = new ConversationStorage(storagePath);
+            var firstClient = new RecordingAgentClient();
+            var firstAgent = new AgentLoop(firstClient, new ToolRegistry(), storage, "conversation-1");
+            await firstAgent.RunAsync("first task");
+
+            var resumedClient = new RecordingAgentClient();
+            var resumedAgent = new AgentLoop(resumedClient, new ToolRegistry(), storage, "conversation-1");
+            await resumedAgent.RunAsync("second task");
+
+            var resumedRequest = Assert.Single(resumedClient.Requests);
+            Assert.Single(resumedRequest.Messages.Where(message => message.Role == "system"));
+            Assert.Equal(2, resumedRequest.Messages.Count(message => message.Role == "user"));
+        }
+        finally
+        {
+            if (File.Exists(storagePath))
+            {
+                File.Delete(storagePath);
+            }
+        }
+    }
+
+    private sealed class RecordingAgentClient(bool returnToolCallFirst = false) : IAgentClient
+    {
+        public List<AgentRequest> Requests { get; } = new();
+
+        public Task<AgentResponse> GetResponseAsync(AgentRequest request, CancellationToken cancellationToken)
+        {
+            Requests.Add(request);
+            if (returnToolCallFirst && Requests.Count == 1)
+            {
+                return Task.FromResult(new AgentResponse
+                {
+                    ToolCalls =
+                    {
+                        new ToolCallDefinition
+                        {
+                            Id = "call-1",
+                            Name = "fixed_result",
+                            Arguments = JsonSerializer.SerializeToElement(new { })
+                        }
+                    }
+                });
+            }
+
+            return Task.FromResult(new AgentResponse { Content = "done" });
+        }
+    }
+
+    private sealed class FixedResultTool(string result = "tool result") : ITool
+    {
+        public string Name => "fixed_result";
+        public string Description => "Returns a fixed test result.";
+        public JsonElement Parameters => JsonSerializer.SerializeToElement(new { type = "object" });
+
+        public Task<string> ExecuteAsync(JsonElement arguments, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(result);
+        }
     }
 }
