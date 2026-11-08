@@ -1,0 +1,30 @@
+{
+  "agent": {
+    "language": "繁體中文（台灣）",
+    "max_context_characters": 32000,
+    "max_iterations": 20,
+    "max_tokens": 8000,
+    "region": "台灣",
+    "show_thinking_process": true,
+    "system_prompt": "",
+    "temperature": 0.7,
+    "tools": {},
+    "workspace": "/home/dev/super-agent-project"
+  },
+  "logging": {
+    "enabled": true,
+    "file_size_limit_bytes": 10485760,
+    "path": "logs/superagent.log",
+    "rolling_interval": "day"
+  },
+  "openai": {
+    "api_key": "dummy",
+    "base_url": "http://192.168.1.102:11434/v1",
+    "model": "gemma4:26b-a4b-it-qat",
+    "request_timeout_seconds": 120
+  },
+  "storage": {
+    "conversation_id": "session-2026-11-07T02-09-25-607Z",
+    "directory": "conversations"
+  }
+}

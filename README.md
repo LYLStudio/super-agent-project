@@ -45,6 +45,24 @@ dotnet build src/SuperAgent.Console/SuperAgent.Console.csproj -c Release
 dotnet run --project src/SuperAgent.Console -- --help
 ```
 
+### 3. 原生 C++ 版本（獨立專案）
+
+原生版本由 `cpp/` 下的 CMake 專案獨立管理，不加入 `SuperAgent.sln`；.NET 專案仍由原 solution 管理。需要 CMake 與 C++17 編譯器；HTTPS 需安裝 OpenSSL 開發套件，未安裝時仍可連線 HTTP 端點。CMake 會下載固定版本的 JSON 與 HTTP 相依套件。
+
+```bash
+cmake -S cpp -B build/cpp -DCMAKE_BUILD_TYPE=Release
+cmake --build build/cpp --config Release
+ctest --test-dir build/cpp --output-on-failure
+```
+
+執行原生版本：
+
+```bash
+OPENAI_API_KEY="your-api-key" build/cpp/superagent-cpp
+```
+
+原生版互動流程已對齊 .NET 主控台：全螢幕自適應輸出、多行提示編輯/歷史、模型文字串流、工具呼叫/結果分段、任務狀態摘要，以及 F2 設定、F3 日誌、F5 熱重載。設定可讀取 .NET `appsettings.json` 命名格式，會話以 .NET 相容格式保存；模型選擇可讀取端點模型清單。原生版另包含檔案讀寫/搜尋、程式碼分析、測試樣板、除錯/重構建議、效能量測、唯讀 SQLite/選配 localhost ODBC 查詢、安全 Shell 命令子集、Git 查詢與需確認的本地變更及結構化輪替日誌。網路搜尋、遠端資料庫連線及破壞性/遠端 Git 操作未開放。因安全界線，C++ Shell/Git 執行政策仍比 .NET 版嚴格；詳細限制與 Windows/macOS 建置方式請見 [cpp/README.md](cpp/README.md)。
+
 互動啟動會使用全螢幕自適應介面：狀態列固定在頂端，快捷鍵與多行輸入固定在底部，中央輸出區會依終端視窗大小即時重排，僅在內容超出可視範圍時顯示右側捲軸。使用 `PageUp`／`PageDown` 捲動輸出；多行或自動折行的提示中，上下鍵會依可視行移動，游標到達首／末行時可瀏覽已送出的提示歷史。輸出會以不同顏色與分段標題區分模型串流、工具執行／結果與最終回答，最終回答以純文字呈現，不套用 Markdown 排版。按 `F2` 開啟設定，`F3` 查看並篩選最近 50 筆日誌（結果顯示在可捲動輸出區），`F5` 熱重載設定。設定修改會保存至目前設定檔（可用 `--config=PATH` 指定），返回對話時立即套用；進入設定時會清除主畫面，避免顯示先前終端命令。命令列參數與環境變數仍會覆蓋設定檔值；API 密鑰會以明文寫入設定檔，請妥善保護檔案權限。若模型未回傳文字，介面會顯示提示。
 
 底部提示區支援多行編輯：`Enter` 換行，`F4` 或 `Ctrl+Enter` 送出；上下鍵在多行或自動折行提示中移動可視行，到達首／末行時瀏覽本次執行期間已送出的提示，左右鍵移動游標，Home／End 移至目前行首／行尾。也支援 Backspace、Delete 與 Ctrl+A／Ctrl+E；視窗尺寸變更時畫面會自動重排。

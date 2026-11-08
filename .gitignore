@@ -26,3 +26,8 @@ _PublishOutput/
 # Logs
 *.log
 logs/
+
+# CPP build
+build/cpp/
+
+conversations/
