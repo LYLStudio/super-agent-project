@@ -156,10 +156,19 @@ AppConfig AppConfig::load(const fs::path& path) {
     const auto data = json::parse(input);
     const auto openai = setting<json>(data, {"openai", "OpenAI"}, json::object());
     const auto agent = setting<json>(data, {"agent", "Agent"}, json::object());
+    const auto copilot = setting<json>(data, {"github_copilot", "GitHubCopilot"}, json::object());
     const auto logging = setting<json>(data, {"logging", "Logging"}, json::object());
     const auto storage = setting<json>(data, {"storage", "Storage"}, json::object());
     config.base_url = setting<std::string>(openai, {"base_url", "BaseUrl"}, config.base_url);
-    config.model = setting<std::string>(openai, {"model", "Model"}, config.model);
+    config.openai_model = setting<std::string>(openai, {"model", "Model"}, config.openai_model);
+    config.copilot_model = setting<std::string>(copilot, {"model", "Model"}, config.copilot_model);
+    config.model_provider = setting<std::string>(agent, {"model_provider", "ModelProvider"}, config.model_provider);
+    auto normalized_provider = config.model_provider;
+    std::transform(normalized_provider.begin(), normalized_provider.end(), normalized_provider.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    config.model = normalized_provider == "githubcopilot" ||
+        normalized_provider == "github-copilot" || normalized_provider == "copilot"
+        ? config.copilot_model : config.openai_model;
     config.api_key = setting<std::string>(openai, {"api_key", "ApiKey"}, config.api_key);
     config.workspace = setting<std::string>(agent, {"workspace", "WorkspaceRoot"}, config.workspace.string());
     config.max_iterations = setting<int>(agent, {"max_iterations", "MaxIterations"}, config.max_iterations);
@@ -202,12 +211,21 @@ void AppConfig::save() const {
         if (!data.is_object()) throw std::runtime_error("configuration root must be a JSON object");
     }
 
+    auto normalized_provider = model_provider;
+    std::transform(normalized_provider.begin(), normalized_provider.end(), normalized_provider.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    const bool copilot_provider = normalized_provider == "githubcopilot" ||
+        normalized_provider == "github-copilot" || normalized_provider == "copilot";
+    const auto saved_openai_model = copilot_provider ? openai_model : model;
+    const auto saved_copilot_model = copilot_provider ? model : copilot_model;
     const bool dotnet_format = data.contains("OpenAI") || data.contains("Agent") || data.contains("Logging");
     if (dotnet_format) {
         data["OpenAI"]["BaseUrl"] = base_url;
-        data["OpenAI"]["Model"] = model;
+        data["OpenAI"]["Model"] = saved_openai_model;
         data["OpenAI"]["ApiKey"] = api_key;
         data["OpenAI"]["RequestTimeoutSeconds"] = request_timeout_seconds;
+        data["Agent"]["ModelProvider"] = model_provider;
+        data["GitHubCopilot"]["Model"] = saved_copilot_model;
         data["Agent"]["WorkspaceRoot"] = workspace.string();
         data["Agent"]["MaxIterations"] = max_iterations;
         data["Agent"]["MaxTokens"] = max_tokens;
@@ -226,9 +244,11 @@ void AppConfig::save() const {
         data["Storage"]["ConversationId"] = conversation_id;
     } else {
         data["openai"]["base_url"] = base_url;
-        data["openai"]["model"] = model;
+        data["openai"]["model"] = saved_openai_model;
         data["openai"]["api_key"] = api_key;
         data["openai"]["request_timeout_seconds"] = request_timeout_seconds;
+        data["agent"]["model_provider"] = model_provider;
+        data["github_copilot"]["model"] = saved_copilot_model;
         data["agent"]["workspace"] = workspace.string();
         data["agent"]["max_iterations"] = max_iterations;
         data["agent"]["max_tokens"] = max_tokens;

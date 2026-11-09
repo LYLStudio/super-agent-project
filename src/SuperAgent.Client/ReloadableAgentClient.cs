@@ -4,17 +4,17 @@ namespace SuperAgent.Client;
 
 public sealed class ReloadableAgentClient : IStreamingAgentClient, IDisposable
 {
-    private OpenAICompatClient? _currentClient;
+    private IStreamingAgentClient? _currentClient;
 
-    public ReloadableAgentClient(OpenAICompatClient initialClient)
+    public ReloadableAgentClient(IStreamingAgentClient initialClient)
     {
         _currentClient = initialClient ?? throw new ArgumentNullException(nameof(initialClient));
     }
 
-    public void Replace(OpenAICompatClient replacement)
+    public void Replace(IStreamingAgentClient replacement)
     {
         ArgumentNullException.ThrowIfNull(replacement);
-        Interlocked.Exchange(ref _currentClient, replacement)?.Dispose();
+        DisposeClient(Interlocked.Exchange(ref _currentClient, replacement));
     }
 
     public Task<AgentResponse> GetResponseAsync(AgentRequest request, CancellationToken cancellationToken)
@@ -32,12 +32,17 @@ public sealed class ReloadableAgentClient : IStreamingAgentClient, IDisposable
 
     public void Dispose()
     {
-        Interlocked.Exchange(ref _currentClient, null)?.Dispose();
+        DisposeClient(Interlocked.Exchange(ref _currentClient, null));
     }
 
-    private OpenAICompatClient GetCurrentClient()
+    private IStreamingAgentClient GetCurrentClient()
     {
         return Volatile.Read(ref _currentClient)
             ?? throw new ObjectDisposedException(nameof(ReloadableAgentClient));
+    }
+
+    private static void DisposeClient(IStreamingAgentClient? client)
+    {
+        (client as IDisposable)?.Dispose();
     }
 }

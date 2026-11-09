@@ -36,6 +36,7 @@ int main() {
 
         const auto loaded = superagent::AppConfig::load(config.config_path);
         require(loaded.model == config.model, "configuration model did not round-trip");
+        require(loaded.model_provider == config.model_provider, "configuration provider did not round-trip");
         require(!loaded.tools.at("code_reader"), "tool setting did not round-trip");
 
         const auto dotnet_config_path = temporary / "appsettings.json";
@@ -49,6 +50,7 @@ int main() {
                     "RequestTimeoutSeconds": 45
                 },
                 "Agent": {
+                    "ModelProvider": "GitHubCopilot",
                     "WorkspaceRoot": ".",
                     "UnmodeledSetting": "preserve-me",
                     "MaxIterations": 20,
@@ -61,6 +63,7 @@ int main() {
                     "Language": "繁體中文（台灣）",
                     "Tools": { "code_reader": false }
                 },
+                "GitHubCopilot": { "Model": "claude-sonnet-4" },
                 "Logging": {
                     "Enabled": false,
                     "Path": "logs/app.log",
@@ -72,6 +75,9 @@ int main() {
         auto dotnet_config = superagent::AppConfig::load(dotnet_config_path);
         require(dotnet_config.base_url == "http://localhost:9000/v1", ".NET BaseUrl setting was not loaded");
         require(dotnet_config.api_key == "test-key", ".NET ApiKey setting was not loaded");
+        require(dotnet_config.model_provider == "GitHubCopilot" &&
+            dotnet_config.model == "claude-sonnet-4",
+            ".NET Copilot provider or model setting was not loaded");
         require(dotnet_config.max_iterations == 20 && dotnet_config.max_tokens == 8000,
             ".NET agent limits were not loaded");
         require(dotnet_config.show_thinking_process && dotnet_config.system_prompt == "custom",
@@ -84,7 +90,9 @@ int main() {
         {
             std::ifstream saved(dotnet_config_path);
             const auto record = superagent::json::parse(saved);
-            require(record.at("OpenAI").at("Model") == "updated-model",
+            require(record.at("OpenAI").at("Model") == "test-model",
+                "saving Copilot settings changed the OpenAI model");
+            require(record.at("GitHubCopilot").at("Model") == "updated-model",
                 "saving settings did not preserve .NET configuration naming");
             require(record.at("Agent").at("UnmodeledSetting") == "preserve-me",
                 "saving settings discarded an unmodeled .NET property");

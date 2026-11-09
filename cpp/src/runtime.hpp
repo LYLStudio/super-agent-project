@@ -13,8 +13,11 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 struct AppConfig {
+    std::string model_provider = "OpenAICompatible";
     std::string base_url = "http://192.168.1.102:11434/v1";
     std::string model = "muse-glimmer:30b-q4_K_M-dflash";
+    std::string openai_model = "muse-glimmer:30b-q4_K_M-dflash";
+    std::string copilot_model = "auto";
     std::string api_key = "dummy";
     fs::path workspace = fs::current_path();
     int max_iterations = 20;

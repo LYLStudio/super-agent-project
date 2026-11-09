@@ -1,5 +1,6 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <copilot/copilot.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -8,10 +9,13 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -54,6 +58,18 @@ bool equals_case_insensitive(const std::string& left, const std::string& right) 
     return left.size() == right.size() && starts_with_case_insensitive(left, right);
 }
 
+bool is_copilot_provider(const std::string& provider) {
+    return equals_case_insensitive(provider, "GitHubCopilot") ||
+        equals_case_insensitive(provider, "github-copilot") ||
+        equals_case_insensitive(provider, "copilot");
+}
+
+bool is_openai_provider(const std::string& provider) {
+    return equals_case_insensitive(provider, "OpenAICompatible") ||
+        equals_case_insensitive(provider, "openai-compatible") ||
+        equals_case_insensitive(provider, "openai");
+}
+
 std::string request_path(const std::string& base_url) {
     const auto scheme = base_url.find("://");
     if (scheme == std::string::npos) {
@@ -89,12 +105,14 @@ void print_help() {
               << "Usage: superagent-cpp [options]\n\n"
               << "  --base-url=URL       OpenAI-compatible API base URL\n"
               << "  --api-key=KEY        API key\n"
+              << "  --provider=NAME     OpenAICompatible or GitHubCopilot\n"
               << "  --model=NAME         Model name\n"
               << "  --workspace=PATH     File-tool workspace root\n"
               << "  --config=PATH        Configuration JSON path\n"
               << "  --conversation-id=ID Conversation identifier\n"
               << "  --max-iterations=N  Maximum tool/response turns\n"
               << "\nEnvironment: OPENAI_API_KEY, SUPERAGENT_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL,\n"
+              << "             GITHUB_COPILOT_MODEL, SUPERAGENT_MODEL_PROVIDER,\n"
               << "             SUPERAGENT_WORKSPACE, SUPERAGENT_CONFIG\n"
               << "Interactive keys: F2 settings, F3 logs, F4 submit, F5 reload\n"
               << "Commands: help, /settings, /logs, /new, exit, quit, q\n"
@@ -265,7 +283,104 @@ void trim_context(std::vector<json>& messages, int max_characters) {
 json request_completion(const superagent::AppConfig& config, const std::string& api_key,
                        const std::vector<json>& messages, const json& tool_definitions,
                        const std::function<void(const std::string&)>& on_chunk,
-                       const std::function<void(const std::string&)>& on_retry) {
+                       const std::function<void(const std::string&)>& on_retry,
+                       const std::function<std::string(const std::string&, const json&)>& execute_tool) {
+    if (is_copilot_provider(config.model_provider)) {
+        copilot::Client client;
+        try {
+            client.start().get();
+            std::vector<copilot::Tool> tools;
+            copilot::ToolSet allowed_tools;
+            std::mutex tool_execution_mutex;
+            if (tool_definitions.is_array()) {
+                for (const auto& definition : tool_definitions) {
+                    if (!definition.is_object() || !definition.contains("function")) continue;
+                    const auto& function = definition.at("function");
+                    if (!function.is_object() || !function.contains("name")) continue;
+                    const auto name = function.at("name").get<std::string>();
+                    copilot::Tool tool;
+                    tool.name = name;
+                    tool.description = function.value("description", std::string{});
+                    tool.parameters_schema = function.value("parameters", json::object());
+                    tool.skip_permission = true;
+                    tool.handler = [name, &execute_tool, &tool_execution_mutex](
+                        const copilot::ToolInvocation& invocation) {
+                        copilot::ToolResultObject result;
+                        const auto arguments = invocation.arguments.value_or(json::object());
+                        try {
+                            std::lock_guard<std::mutex> lock(tool_execution_mutex);
+                            result.text_result_for_llm = execute_tool(name, arguments);
+                        } catch (const std::exception& error) {
+                            result.result_type = copilot::ToolResultType::Failure;
+                            result.error = error.what();
+                            result.text_result_for_llm = "Error: " + std::string(error.what());
+                        }
+                        return result;
+                    };
+                    allowed_tools.add_custom(name);
+                    tools.push_back(std::move(tool));
+                }
+            }
+
+            copilot::SessionConfig session_config;
+            session_config.model = config.model;
+            session_config.working_directory = config.workspace.string();
+            session_config.streaming = config.show_thinking_process;
+            session_config.tools = std::move(tools);
+            session_config.available_tools = allowed_tools.to_vector();
+
+            const auto system_message = std::find_if(messages.begin(), messages.end(), [](const json& message) {
+                return message.value("role", std::string{}) == "system";
+            });
+            if (system_message != messages.end()) {
+                session_config.system_message = copilot::SystemMessageConfig{
+                    .mode = copilot::SystemMessageMode::Append,
+                    .content = system_message->value("content", std::string{})
+                };
+            }
+
+            std::ostringstream prompt;
+            prompt << "Conversation history:\n";
+            for (const auto& message : messages) {
+                const auto role = message.value("role", std::string{});
+                if (role == "system") continue;
+                prompt << role << ": " << message.value("content", std::string{}) << '\n';
+                if (message.contains("tool_calls")) {
+                    prompt << "Tool calls: " << message.at("tool_calls").dump() << '\n';
+                }
+            }
+
+            auto session = client.create_session(std::move(session_config)).get();
+            auto subscription = session->on([&](const copilot::SessionEvent& event) {
+                if (const auto* delta = event.try_as<copilot::AssistantMessageDeltaData>();
+                    delta != nullptr && on_chunk && !delta->delta_content.empty()) {
+                    on_chunk(delta->delta_content);
+                }
+            });
+            copilot::MessageOptions options;
+            options.prompt = prompt.str();
+            const auto response = session->send_and_wait(
+                std::move(options), std::chrono::seconds(config.request_timeout_seconds)).get();
+            if (!response) {
+                throw std::runtime_error("Copilot SDK completed without an assistant response.");
+            }
+            const auto* message = response->try_as<copilot::AssistantMessageData>();
+            if (message == nullptr) {
+                throw std::runtime_error("Copilot SDK returned an unexpected response event.");
+            }
+
+            session->destroy().get();
+            const auto stop_errors = client.stop().get();
+            if (!stop_errors.empty()) {
+                throw std::runtime_error("Copilot SDK failed to stop cleanly.");
+            }
+            return json{{"role", "assistant"}, {"content", message->content}};
+        } catch (...) {
+            client.force_stop();
+            throw;
+        }
+    }
+
     const bool stream = config.show_thinking_process;
     json body = {
         {"model", config.model},
@@ -421,6 +536,32 @@ std::vector<std::string> recent_log_lines(superagent::StructuredLogger& logger) 
 
 std::vector<std::string> fetch_model_names(const superagent::AppConfig& config) {
     try {
+        if (is_copilot_provider(config.model_provider)) {
+            copilot::Client client;
+            try {
+                client.start().get();
+                const auto catalog = client.list_models().get();
+                std::vector<std::string> models;
+                std::set<std::string> unique;
+                for (const auto& model : catalog) {
+                    auto normalized = model.id;
+                    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                    if (!model.id.empty() && unique.insert(normalized).second) {
+                        models.push_back(model.id);
+                    }
+                }
+                const auto stop_errors = client.stop().get();
+                if (!stop_errors.empty()) {
+                    throw std::runtime_error("Copilot SDK failed to stop cleanly.");
+                }
+                return models;
+            } catch (...) {
+                client.force_stop();
+                throw;
+            }
+        }
+
         httplib::Client client(endpoint_origin(config.base_url));
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(std::min(config.request_timeout_seconds, 10), 0);
@@ -456,7 +597,7 @@ std::vector<std::string> fetch_model_names(const superagent::AppConfig& config) 
         }
         return models;
     } catch (const std::exception& error) {
-        std::cerr << "無法從端點取得模型清單: " << error.what() << '\n';
+        std::cerr << "無法取得模型清單: " << error.what() << '\n';
         return {};
     }
 }
@@ -472,7 +613,7 @@ void edit_settings(superagent::AppConfig& config, superagent::StructuredLogger& 
         "Temperature", "最大輸出 Token", "上下文字元上限", "顯示處理過程",
         "系統預設提示詞", "地區", "語系", "Agent 工作區路徑",
         "日誌記錄啟用", "日誌切檔週期", "日誌檔案大小上限 (MiB)",
-        "管理工具啟用狀態", "返回對話"
+        "管理工具啟用狀態", "推論供應者", "返回對話"
     };
     while (true) {
         auto options = settings;
@@ -493,6 +634,7 @@ void edit_settings(superagent::AppConfig& config, superagent::StructuredLogger& 
         options[14] += " (" + config.log_rolling_interval + ")";
         options[15] += " (" + std::to_string(config.log_file_size_limit / (1024 * 1024)) + " MiB)";
         options[16] += " (" + std::to_string(names.size()) + " 個工具)";
+        options[17] += " (" + config.model_provider + ")";
 
         const auto selected = superagent::ConsoleView::select_menu(
             "設定 (儲存後返回會立即套用)", options);
@@ -536,7 +678,7 @@ void edit_settings(superagent::AppConfig& config, superagent::StructuredLogger& 
         } else if (selected == 2) {
             auto model_names = fetch_model_names(config);
             if (model_names.empty()) {
-                std::cout << "無法取得端點模型清單，請手動輸入模型名稱。\n";
+                std::cout << "無法取得模型清單，請手動輸入模型名稱。\n";
                 const auto model = read_input("模型名稱: ");
                 if (model.empty()) changed = false;
                 else config.model = model;
@@ -628,12 +770,23 @@ void edit_settings(superagent::AppConfig& config, superagent::StructuredLogger& 
             if (parse_number(read_input("檔案大小上限 MiB（1-1024）: "), mib) && mib >= 1 && mib <= 1024)
                 config.log_file_size_limit = mib * 1024 * 1024;
             else changed = false;
+        } else if (selected == 17) {
+            const auto provider = superagent::ConsoleView::select_menu(
+                "推論供應者", {"OpenAI 相容 API", "GitHub Copilot"});
+            if (provider < 0) {
+                changed = false;
+            } else {
+                config.model_provider = provider == 0 ? "OpenAICompatible" : "GitHubCopilot";
+                config.model = provider == 0 ? config.openai_model : config.copilot_model;
+            }
         }
         if (!changed) {
             std::cout << "設定未變更：輸入無效或已取消。\n";
             continue;
         }
         try {
+            if (is_copilot_provider(config.model_provider)) config.copilot_model = config.model;
+            else config.openai_model = config.model;
             config.save();
             logger = superagent::StructuredLogger(config);
             std::cout << "設定已保存並套用。\n";
@@ -651,6 +804,7 @@ int main(int argc, char** argv) {
         std::string config_path = environment("SUPERAGENT_CONFIG", "superagent-cpp.json");
         std::optional<std::string> base_url_override;
         std::optional<std::string> model_override;
+        std::optional<std::string> provider_override;
         std::optional<std::string> api_key_override;
         std::optional<std::string> workspace_override;
         std::optional<std::string> conversation_override;
@@ -665,6 +819,7 @@ int main(int argc, char** argv) {
             else if (starts_with_case_insensitive(argument, "--base-url=")) base_url_override = option_value(argument, "--base-url");
             else if (starts_with_case_insensitive(argument, "--api-key=")) api_key_override = option_value(argument, "--api-key");
             else if (starts_with_case_insensitive(argument, "--model=")) model_override = option_value(argument, "--model");
+            else if (starts_with_case_insensitive(argument, "--provider=")) provider_override = option_value(argument, "--provider");
             else if (starts_with_case_insensitive(argument, "--workspace=")) workspace_override = option_value(argument, "--workspace");
             else if (starts_with_case_insensitive(argument, "--conversation-id=")) conversation_override = option_value(argument, "--conversation-id");
             else if (starts_with_case_insensitive(argument, "--max-iterations=")) max_iterations_override = std::stoi(option_value(argument, "--max-iterations"));
@@ -673,11 +828,21 @@ int main(int argc, char** argv) {
 
         auto config = superagent::AppConfig::load(config_path);
         if (const char* value = std::getenv("OPENAI_BASE_URL")) config.base_url = value;
-        if (const char* value = std::getenv("OPENAI_MODEL")) config.model = value;
+        if (const char* value = std::getenv("OPENAI_MODEL")) config.openai_model = value;
         if (const char* value = std::getenv("SUPERAGENT_WORKSPACE")) config.workspace = value;
         if (const char* value = std::getenv("SUPERAGENT_API_KEY")) config.api_key = value;
         if (const char* value = std::getenv("OPENAI_API_KEY")) config.api_key = value;
+        if (const char* value = std::getenv("SUPERAGENT_MODEL_PROVIDER")) config.model_provider = value;
+        if (const char* value = std::getenv("GITHUB_COPILOT_MODEL")) config.copilot_model = value;
+        if (provider_override) config.model_provider = *provider_override;
         if (base_url_override) config.base_url = *base_url_override;
+        if (is_copilot_provider(config.model_provider)) {
+            config.model = config.copilot_model;
+        } else if (is_openai_provider(config.model_provider)) {
+            config.model = config.openai_model;
+        } else {
+            throw std::runtime_error("model provider must be OpenAICompatible or GitHubCopilot");
+        }
         if (model_override) config.model = *model_override;
         if (workspace_override) config.workspace = *workspace_override;
         if (conversation_override) config.conversation_id = *conversation_override;
@@ -738,8 +903,11 @@ int main(int argc, char** argv) {
         logger.write("info", "Application started", "SuperAgent");
         superagent::ConsoleView console("SuperAgent | " + config.model + " | " + config.workspace.string());
         console.append_text("SuperAgent AI Agent CLI\n");
+        console.append_text("Model provider: " + config.model_provider + "\n");
         console.append_text("Model: " + config.model + "\n");
-        console.append_text("Endpoint: " + config.base_url + "\n");
+        if (!is_copilot_provider(config.model_provider)) {
+            console.append_text("Endpoint: " + config.base_url + "\n");
+        }
         console.append_text("Max iterations: " + std::to_string(config.max_iterations) + "\n");
         console.append_text("Show thinking process: " + std::string(config.show_thinking_process ? "True" : "False") + "\n");
         console.append_text("Agent 工作區: " + config.workspace.string() + "\n");
@@ -782,11 +950,21 @@ int main(int argc, char** argv) {
                 next.config_path = config.config_path;
                 next.conversation_id = config.conversation_id;
                 if (const char* value = std::getenv("OPENAI_BASE_URL")) next.base_url = value;
-                if (const char* value = std::getenv("OPENAI_MODEL")) next.model = value;
+                if (const char* value = std::getenv("OPENAI_MODEL")) next.openai_model = value;
                 if (const char* value = std::getenv("SUPERAGENT_WORKSPACE")) next.workspace = value;
                 if (const char* value = std::getenv("SUPERAGENT_API_KEY")) next.api_key = value;
                 if (const char* value = std::getenv("OPENAI_API_KEY")) next.api_key = value;
+                if (const char* value = std::getenv("SUPERAGENT_MODEL_PROVIDER")) next.model_provider = value;
+                if (const char* value = std::getenv("GITHUB_COPILOT_MODEL")) next.copilot_model = value;
+                if (provider_override) next.model_provider = *provider_override;
                 if (base_url_override) next.base_url = *base_url_override;
+                if (is_copilot_provider(next.model_provider)) {
+                    next.model = next.copilot_model;
+                } else if (is_openai_provider(next.model_provider)) {
+                    next.model = next.openai_model;
+                } else {
+                    throw std::runtime_error("model provider must be OpenAICompatible or GitHubCopilot");
+                }
                 if (model_override) next.model = *model_override;
                 if (workspace_override) next.workspace = *workspace_override;
                 if (api_key_override && !api_key_override->empty()) next.api_key = *api_key_override;
@@ -905,6 +1083,12 @@ int main(int argc, char** argv) {
                             } else {
                                 std::cerr << "[重試] GenerateResponse: " << error << '\n';
                             }
+                        },
+                        [&](const std::string& name, const json& arguments) {
+                            logger.write("info", "Tool started: " + name, "Agent");
+                            const auto result = tools.execute(name, arguments);
+                            logger.write("info", "Tool completed: " + name, "Agent");
+                            return result;
                         });
 
                     messages.push_back(assistant);

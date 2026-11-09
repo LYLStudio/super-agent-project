@@ -11,6 +11,7 @@ var configPath = Environment.GetEnvironmentVariable("SUPERAGENT_CONFIG")
 string? modelOverride = null;
 string? baseUrlOverride = null;
 string? apiKeyOverride = null;
+string? providerOverride = null;
 
 foreach (var arg in args)
 {
@@ -30,6 +31,10 @@ foreach (var arg in args)
     {
         baseUrlOverride = arg.Substring(arg.IndexOf('=') + 1);
     }
+    else if (arg.StartsWith("--provider=", StringComparison.OrdinalIgnoreCase))
+    {
+        providerOverride = arg.Substring(arg.IndexOf('=') + 1);
+    }
 }
 
 if (args.Any(arg => arg.Equals("--help", StringComparison.OrdinalIgnoreCase) ||
@@ -40,7 +45,8 @@ if (args.Any(arg => arg.Equals("--help", StringComparison.OrdinalIgnoreCase) ||
     AnsiConsole.WriteLine("用法: SuperAgent [選項]");
     AnsiConsole.MarkupLine("");
     AnsiConsole.MarkupLine("[bold]選項:[/]");
-    AnsiConsole.MarkupLine("  --model=NAME  使用的模型名稱 (預設: gpt-oss:20b)");
+    AnsiConsole.MarkupLine("  --provider=NAME  推論供應者: OpenAICompatible 或 GitHubCopilot");
+    AnsiConsole.MarkupLine("  --model=NAME  使用的模型名稱 (GitHubCopilot 預設: auto)");
     AnsiConsole.MarkupLine("  --api-key=KEY  API 密鑰 (預設: dummy)");
     AnsiConsole.MarkupLine("  --config=PATH  設定檔路徑 (預設: appsettings.json)");
     AnsiConsole.MarkupLine("  --base-url=URL  API 端點 URL (預設: http://192.168.1.102:11434/v1)");
@@ -52,10 +58,23 @@ if (args.Any(arg => arg.Equals("--help", StringComparison.OrdinalIgnoreCase) ||
 var fullConfigPath = Path.GetFullPath(configPath);
 IConfigurationRoot configuration = BuildConfiguration(fullConfigPath);
 
+var modelProvider = providerOverride
+    ?? Environment.GetEnvironmentVariable("SUPERAGENT_MODEL_PROVIDER")
+    ?? configuration["Agent:ModelProvider"]
+    ?? "OpenAICompatible";
+var isCopilotProvider = IsCopilotProvider(modelProvider);
+if (!isCopilotProvider && !IsOpenAIProvider(modelProvider))
+{
+    throw new InvalidOperationException("Agent:ModelProvider 必須是 OpenAICompatible 或 GitHubCopilot。");
+}
 var model = modelOverride
-    ?? Environment.GetEnvironmentVariable("OPENAI_MODEL")
-    ?? configuration["OpenAI:Model"]
-    ?? "gpt-oss:20b";
+    ?? (isCopilotProvider
+        ? Environment.GetEnvironmentVariable("GITHUB_COPILOT_MODEL")
+            ?? configuration["GitHubCopilot:Model"]
+            ?? "auto"
+        : Environment.GetEnvironmentVariable("OPENAI_MODEL")
+            ?? configuration["OpenAI:Model"]
+            ?? "gpt-oss:20b");
 var baseUrl = baseUrlOverride
     ?? Environment.GetEnvironmentVariable("OPENAI_BASE_URL")
     ?? configuration["OpenAI:BaseUrl"]
@@ -119,13 +138,14 @@ if (string.IsNullOrWhiteSpace(agentConfig.Region) || string.IsNullOrWhiteSpace(a
     throw new InvalidOperationException("設定 Agent:Region 與 Agent:Language 不可為空。");
 }
 
-using var client = new ReloadableAgentClient(new OpenAICompatClient(
-    baseUrl,
-    () => apiKey,
-    () => model,
-    requestTimeout: TimeSpan.FromSeconds(requestTimeoutSeconds)));
-
 var registry = new ToolRegistry();
+using var client = new ReloadableAgentClient(CreateAgentClient(
+    modelProvider,
+    model,
+    baseUrl,
+    apiKey,
+    workspaceAccessPolicy.WorkspaceRoot,
+    requestTimeoutSeconds));
 InteractiveConsoleView? consoleView = InteractiveConsoleView.IsInteractive
     ? new InteractiveConsoleView($"SuperAgent | {model} | {workspaceAccessPolicy.WorkspaceRoot}")
     : null;
@@ -137,8 +157,12 @@ var agent = new AgentLoop(client, registry, agentConfig);
 var promptHistory = new List<string>();
 var streamedIterations = new HashSet<int>();
 WriteMarkupLine("[bold]SuperAgent AI Agent CLI[/]");
+WriteMarkupLine($"[bold]Model provider:[/] {modelProvider}");
 WriteMarkupLine($"[bold]Model:[/] {model}");
-WriteMarkupLine($"[bold]Endpoint:[/] {baseUrl}");
+if (!isCopilotProvider)
+{
+    WriteMarkupLine($"[bold]Endpoint:[/] {baseUrl}");
+}
 WriteMarkupLine($"[bold]Max iterations:[/] {agentConfig.MaxIterations}");
 WriteMarkupLine($"[bold]Show thinking process:[/] {agentConfig.ShowThinkingProcess}");
 WriteMarkupLine($"[bold]Agent 工作區:[/] {Markup.Escape(workspaceAccessPolicy.WorkspaceRoot)}");
@@ -589,6 +613,25 @@ async Task SelectModelFromEndpointAsync()
     var settings = BuildConfiguration(fullConfigPath);
     try
     {
+        if (IsCopilotProvider(modelProvider))
+        {
+            var configuredCopilotModel = Environment.GetEnvironmentVariable("GITHUB_COPILOT_MODEL")
+                ?? settings["GitHubCopilot:Model"]
+                ?? "auto";
+            var selectedCopilotModel = AnsiConsole.Ask(
+                "GitHub Copilot 模型名稱:",
+                configuredCopilotModel);
+            if (string.IsNullOrWhiteSpace(selectedCopilotModel))
+            {
+                AnsiConsole.MarkupLine("[yellow]模型名稱不可為空，設定未變更。[/]");
+                return;
+            }
+
+            SaveConfigurationValue(fullConfigPath, "GitHubCopilot", "Model", JsonValue.Create(selectedCopilotModel));
+            AnsiConsole.MarkupLine($"[green]已保存 GitHub Copilot 模型 {Markup.Escape(selectedCopilotModel)}。[/]");
+            return;
+        }
+
         var endpoint = baseUrlOverride
             ?? Environment.GetEnvironmentVariable("OPENAI_BASE_URL")
             ?? settings["OpenAI:BaseUrl"]
@@ -677,10 +720,23 @@ void ReloadConfiguration(bool announce)
 
     try
     {
+        var nextModelProvider = providerOverride
+            ?? Environment.GetEnvironmentVariable("SUPERAGENT_MODEL_PROVIDER")
+            ?? configuration["Agent:ModelProvider"]
+            ?? "OpenAICompatible";
+        var nextIsCopilotProvider = IsCopilotProvider(nextModelProvider);
+        if (!nextIsCopilotProvider && !IsOpenAIProvider(nextModelProvider))
+        {
+            throw new InvalidOperationException("Agent:ModelProvider 必須是 OpenAICompatible 或 GitHubCopilot。");
+        }
         var nextModel = modelOverride
-            ?? Environment.GetEnvironmentVariable("OPENAI_MODEL")
-            ?? configuration["OpenAI:Model"]
-            ?? "gpt-oss:20b";
+            ?? (nextIsCopilotProvider
+                ? Environment.GetEnvironmentVariable("GITHUB_COPILOT_MODEL")
+                    ?? configuration["GitHubCopilot:Model"]
+                    ?? "auto"
+                : Environment.GetEnvironmentVariable("OPENAI_MODEL")
+                    ?? configuration["OpenAI:Model"]
+                    ?? "gpt-oss:20b");
         var nextBaseUrl = baseUrlOverride
             ?? Environment.GetEnvironmentVariable("OPENAI_BASE_URL")
             ?? configuration["OpenAI:BaseUrl"]
@@ -734,12 +790,15 @@ void ReloadConfiguration(bool announce)
             }
         }
 
-        var nextClient = new OpenAICompatClient(
+        var nextClient = CreateAgentClient(
+            nextModelProvider,
+            nextModel,
             nextBaseUrl,
-            () => apiKey,
-            () => model,
-            requestTimeout: TimeSpan.FromSeconds(nextTimeout));
+            nextApiKey,
+            nextWorkspacePolicy.WorkspaceRoot,
+            nextTimeout);
 
+        modelProvider = nextModelProvider;
         model = nextModel;
         baseUrl = nextBaseUrl;
         apiKey = nextApiKey;
@@ -771,7 +830,7 @@ void ReloadConfiguration(bool announce)
         if (announce)
         {
             WriteMarkupLine("[green]設定已熱重載並套用至後續對話。[/]");
-            WriteMarkupLine($"[grey]模型: {Markup.Escape(model)} | 工作區: {Markup.Escape(workspaceRoot)} | 檔案工作區外存取: {allowOutsideWorkspace} | 工作區外命令存取: {outsideWorkspaceCommandAccess} | 日誌: {(loggingEnabled ? "啟用" : "停用")}[/]");
+            WriteMarkupLine($"[grey]供應者: {Markup.Escape(modelProvider)} | 模型: {Markup.Escape(model)} | 工作區: {Markup.Escape(workspaceRoot)} | 檔案工作區外存取: {allowOutsideWorkspace} | 工作區外命令存取: {outsideWorkspaceCommandAccess} | 日誌: {(loggingEnabled ? "啟用" : "停用")}[/]");
         }
     }
     catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or IOException or UnauthorizedAccessException or FormatException or ArgumentException)
@@ -780,6 +839,44 @@ void ReloadConfiguration(bool announce)
         (nextConfiguration as IDisposable)?.Dispose();
         WriteMarkupLine($"[red]設定重載失敗，保留目前設定: {Markup.Escape(ex.Message)}[/]");
     }
+}
+
+IStreamingAgentClient CreateAgentClient(
+    string provider,
+    string selectedModel,
+    string endpoint,
+    string selectedApiKey,
+    string selectedWorkspace,
+    int timeoutSeconds)
+{
+    if (IsCopilotProvider(provider))
+    {
+        return new GitHubCopilotAgentClient(
+            registry,
+            selectedModel,
+            selectedWorkspace,
+            TimeSpan.FromSeconds(timeoutSeconds));
+    }
+
+    return new OpenAICompatClient(
+        endpoint,
+        () => selectedApiKey,
+        () => selectedModel,
+        requestTimeout: TimeSpan.FromSeconds(timeoutSeconds));
+}
+
+bool IsCopilotProvider(string provider)
+{
+    return provider.Equals("GitHubCopilot", StringComparison.OrdinalIgnoreCase) ||
+        provider.Equals("github-copilot", StringComparison.OrdinalIgnoreCase) ||
+        provider.Equals("copilot", StringComparison.OrdinalIgnoreCase);
+}
+
+bool IsOpenAIProvider(string provider)
+{
+    return provider.Equals("OpenAICompatible", StringComparison.OrdinalIgnoreCase) ||
+        provider.Equals("openai-compatible", StringComparison.OrdinalIgnoreCase) ||
+        provider.Equals("openai", StringComparison.OrdinalIgnoreCase);
 }
 
 int ReadIntSetting(string key, int defaultValue)
