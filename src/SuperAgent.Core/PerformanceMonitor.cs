@@ -87,6 +87,24 @@ public class PerformanceMonitor : ITool
             };
             metrics.Add(metric);
 
+            // 檢查效能警報
+            var triggeredAlerts = PerformanceAlertManager.CheckAndAlert(metric);
+            if (triggeredAlerts.Count > 0)
+            {
+                foreach (var alert in triggeredAlerts)
+                {
+                    metrics.Add(new PerformanceMetric
+                    {
+                        Operation = $"[ALERT] {alert.RuleName}",
+                        ElapsedMilliseconds = alert.ElapsedMilliseconds,
+                        ElapsedSeconds = alert.ElapsedSeconds,
+                        Timestamp = alert.Timestamp,
+                        Iteration = iteration,
+                        ComplexityScore = -1
+                    });
+                }
+            }
+
             lock (MetricsLock)
             {
                 Metrics.Enqueue(metric);
@@ -174,6 +192,23 @@ public class PerformanceMonitor : ITool
             lines.Add($"{index + 1}. {metrics[index].ElapsedMilliseconds:F3} ms (複雜度 {metrics[index].ComplexityScore})");
         }
 
+        // 效能警報報告
+        var alerts = PerformanceAlertManager.GetAlerts();
+        if (alerts.Count > 0)
+        {
+            lines.Add("");
+            lines.Add("=== 效能警報 ===");
+            foreach (var alert in alerts)
+            {
+                lines.Add($"[{alert.Severity.ToUpper()}] {alert.Timestamp}: {alert.Message}");
+            }
+            lines.Add("");
+        }
+
+        lines.Add("");
+        lines.Add("=== 效能警報統計 ===");
+        lines.Add(PerformanceAlertManager.GetAlertStatistics());
+
         return string.Join("\n", lines);
     }
 
@@ -202,4 +237,194 @@ public class PerformanceMetric
     public string Timestamp { get; set; } = string.Empty;
     public int Iteration { get; set; }
     public int ComplexityScore { get; set; }
+}
+
+/// <summary>
+/// PerformanceAlertRule - 效能警報規則
+/// 定義觸發警報的條件
+/// </summary>
+public class PerformanceAlertRule
+{
+    public string RuleName { get; set; } = string.Empty;
+    public string Operation { get; set; } = string.Empty;
+    public double ThresholdMilliseconds { get; set; }
+    public string Severity { get; set; } = "warning";
+    public bool IsEnabled { get; set; } = true;
+}
+
+/// <summary>
+/// PerformanceAlert - 效能警報記錄
+/// </summary>
+public class PerformanceAlert
+{
+    public string RuleName { get; set; } = string.Empty;
+    public string Operation { get; set; } = string.Empty;
+    public double ElapsedMilliseconds { get; set; }
+    public double ElapsedSeconds { get; set; }
+    public double ThresholdMilliseconds { get; set; }
+    public string Severity { get; set; } = string.Empty;
+    public string Timestamp { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// PerformanceAlertManager - 效能警報管理器
+/// 支援即時效能指標收集與自訂警報規則
+/// </summary>
+public class PerformanceAlertManager
+{
+    private static readonly object Lock = new();
+    private static readonly List<PerformanceAlertRule> _rules = new();
+    private static readonly List<PerformanceAlert> _alerts = new();
+    private static readonly int _maxAlerts = 1000;
+
+    /// <summary>
+    /// 新增警報規則
+    /// </summary>
+    /// <param name="rule">警報規則</param>
+    public static void AddRule(PerformanceAlertRule rule)
+    {
+        lock (Lock)
+        {
+            _rules.Add(rule);
+        }
+    }
+
+    /// <summary>
+    /// 移除警報規則
+    /// </summary>
+    /// <param name="ruleName">規則名稱</param>
+    public static bool RemoveRule(string ruleName)
+    {
+        lock (Lock)
+        {
+            var removed = _rules.RemoveAll(r => r.RuleName.Equals(ruleName, StringComparison.OrdinalIgnoreCase));
+            return removed > 0;
+        }
+    }
+
+    /// <summary>
+    /// 取得所有警報規則
+    /// </summary>
+    public static List<PerformanceAlertRule> GetRules()
+    {
+        lock (Lock)
+        {
+            return new List<PerformanceAlertRule>(_rules);
+        }
+    }
+
+    /// <summary>
+    /// 檢查效能指標並觸發警報
+    /// </summary>
+    /// <param name="metric">效能指標</param>
+    /// <returns>觸發的警報列表</returns>
+    public static List<PerformanceAlert> CheckAndAlert(PerformanceMetric metric)
+    {
+        var triggeredAlerts = new List<PerformanceAlert>();
+
+        lock (Lock)
+        {
+            foreach (var rule in _rules)
+            {
+                if (!rule.IsEnabled)
+                {
+                    continue;
+                }
+
+                // 檢查操作名稱是否匹配
+                if (!string.IsNullOrEmpty(rule.Operation) &&
+                    !rule.Operation.Equals(metric.Operation, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // 檢查閾值
+                if (metric.ElapsedMilliseconds > rule.ThresholdMilliseconds)
+                {
+                    var alert = new PerformanceAlert
+                    {
+                        RuleName = rule.RuleName,
+                        Operation = metric.Operation,
+                        ElapsedMilliseconds = metric.ElapsedMilliseconds,
+                        ThresholdMilliseconds = rule.ThresholdMilliseconds,
+                        Severity = rule.Severity,
+                        Timestamp = DateTime.UtcNow.ToString("o"),
+                        Message = $"效能警報: 操作 '{metric.Operation}' 耗時 {metric.ElapsedMilliseconds:F2} ms 超過閾值 {rule.ThresholdMilliseconds:F2} ms (嚴重度: {rule.Severity})"
+                    };
+
+                    triggeredAlerts.Add(alert);
+                    _alerts.Add(alert);
+
+                    // 維持警報數量上限
+                    while (_alerts.Count > _maxAlerts)
+                    {
+                        _alerts.RemoveAt(0);
+                    }
+                }
+            }
+        }
+
+        return triggeredAlerts;
+    }
+
+    /// <summary>
+    /// 取得所有警報記錄
+    /// </summary>
+    public static List<PerformanceAlert> GetAlerts()
+    {
+        lock (Lock)
+        {
+            return new List<PerformanceAlert>(_alerts);
+        }
+    }
+
+    /// <summary>
+    /// 清除所有警報
+    /// </summary>
+    public static void ClearAlerts()
+    {
+        lock (Lock)
+        {
+            _alerts.Clear();
+        }
+    }
+
+    /// <summary>
+    /// 取得警報統計
+    /// </summary>
+    public static string GetAlertStatistics()
+    {
+        lock (Lock)
+        {
+            if (_alerts.Count == 0)
+            {
+                return "無警報記錄";
+            }
+
+            var stats = new Dictionary<string, int>();
+            foreach (var alert in _alerts)
+            {
+                if (!stats.ContainsKey(alert.Severity))
+                {
+                    stats[alert.Severity] = 0;
+                }
+                stats[alert.Severity]++;
+            }
+
+            var lines = new List<string>
+            {
+                "=== 效能警報統計 ===",
+                $"總警報數: {_alerts.Count}",
+                ""
+            };
+
+            foreach (var kvp in stats.OrderByDescending(k => k.Key))
+            {
+                lines.Add($"{kvp.Key}: {kvp.Value} 筆");
+            }
+
+            return string.Join("\n", lines);
+        }
+    }
 }

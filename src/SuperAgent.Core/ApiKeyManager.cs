@@ -8,12 +8,13 @@ namespace SuperAgent.Core;
 
 /// <summary>
 /// API 密鑰管理系統
-/// 支援密鑰加密儲存、輪替與有效性檢查
+/// 支援密鑰加密儲存、輪替與有效性檢查，包括環境變數加密
 /// </summary>
 public class ApiKeyManager
 {
     private readonly List<ApiKeyInfo> _keys = new();
     private readonly string _encryptionKey;
+    private readonly object _lock = new();
 
     /// <summary>
     /// API 密鑰資訊
@@ -45,25 +46,28 @@ public class ApiKeyManager
     /// <param name="environmentVariable">環境變數名稱 (可選)</param>
     public void AddKey(string name, string value, string? environmentVariable = null)
     {
-        if (string.IsNullOrWhiteSpace(name))
+        lock (_lock)
         {
-            throw new ArgumentException("密鑰名稱不能為空", nameof(name));
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentException("密鑰名稱不能為空", nameof(name));
+            }
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new ArgumentException("密鑰值不能為空", nameof(value));
+            }
+
+            var encryptedValue = Encrypt(value);
+
+            _keys.Add(new ApiKeyInfo
+            {
+                Name = name,
+                EncryptedValue = encryptedValue,
+                EnvironmentVariable = environmentVariable,
+                IsActive = true
+            });
         }
-
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            throw new ArgumentException("密鑰值不能為空", nameof(value));
-        }
-
-        var encryptedValue = Encrypt(value);
-
-        _keys.Add(new ApiKeyInfo
-        {
-            Name = name,
-            EncryptedValue = encryptedValue,
-            EnvironmentVariable = environmentVariable,
-            IsActive = true
-        });
     }
 
     /// <summary>
@@ -89,12 +93,15 @@ public class ApiKeyManager
     /// <param name="config">設定字典</param>
     public void LoadFromConfig(Dictionary<string, string> config)
     {
-        foreach (var kvp in config)
+        lock (_lock)
         {
-            if (kvp.Key.StartsWith("ApiKey:", StringComparison.OrdinalIgnoreCase))
+            foreach (var kvp in config)
             {
-                var name = kvp.Key.Substring("ApiKey:".Length);
-                AddKey(name, kvp.Value);
+                if (kvp.Key.StartsWith("ApiKey:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var name = kvp.Key.Substring("ApiKey:".Length);
+                    AddKey(name, kvp.Value);
+                }
             }
         }
     }
@@ -245,5 +252,118 @@ public class ApiKeyManager
     {
         // 生成默認加密密鑰 (在生產環境中應從安全位置載入)
         return Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+    }
+
+    /// <summary>
+    /// 加密環境變數值並儲存
+    /// 支援環境變數加密，防止敏感資訊明文暴露
+    /// </summary>
+    /// <param name="environmentVariable">環境變數名稱</param>
+    /// <param name="value">要加密的值</param>
+    /// <returns>加密後的值</returns>
+    public string EncryptEnvironmentVariable(string environmentVariable, string value)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(environmentVariable))
+            {
+                throw new ArgumentException("環境變數名稱不能為空", nameof(environmentVariable));
+            }
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new ArgumentException("環境變數值不能為空", nameof(value));
+            }
+
+            var encryptedValue = Encrypt(value);
+            return encryptedValue;
+        }
+    }
+
+    /// <summary>
+    /// 解密環境變數值
+    /// </summary>
+    /// <param name="environmentVariable">環境變數名稱</param>
+    /// <param name="encryptedValue">加密後的值</param>
+    /// <returns>解密後的值</returns>
+    public string DecryptEnvironmentVariable(string environmentVariable, string encryptedValue)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(environmentVariable))
+            {
+                throw new ArgumentException("環境變數名稱不能為空", nameof(environmentVariable));
+            }
+
+            if (string.IsNullOrWhiteSpace(encryptedValue))
+            {
+                throw new ArgumentException("加密值不能為空", nameof(encryptedValue));
+            }
+
+            return Decrypt(encryptedValue);
+        }
+    }
+
+    /// <summary>
+    /// 從環境變數載入並加密儲存密鑰
+    /// 讀取環境變數中的敏感值，加密後儲存到 ApiKeyManager 中
+    /// </summary>
+    /// <param name="environmentVariable">環境變數名稱</param>
+    /// <param name="keyName">密鑰名稱 (可選，預設為環境變數名稱)</param>
+    public void LoadFromEnvironmentEncrypted(string environmentVariable, string? keyName = null)
+    {
+        var value = Environment.GetEnvironmentVariable(environmentVariable);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new ArgumentException($"環境變數 '{environmentVariable}' 未設定", nameof(environmentVariable));
+        }
+
+        var name = keyName ?? environmentVariable;
+        AddKey(name, value, environmentVariable);
+
+        // 記錄環境變數來源，以便後續從環境變數同步
+        lock (_lock)
+        {
+            var keyInfo = _keys.LastOrDefault(k => k.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (keyInfo != null)
+            {
+                keyInfo.EnvironmentVariable = environmentVariable;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 同步所有已註冊環境變數的密鑰
+    /// 從環境變數重新載入並更新密鑰值，支援動態輪替
+    /// </summary>
+    public void SyncEnvironmentKeys()
+    {
+        lock (_lock)
+        {
+            var envKeys = _keys.Where(k => !string.IsNullOrEmpty(k.EnvironmentVariable)).ToList();
+
+            foreach (var keyInfo in envKeys)
+            {
+                var envValue = Environment.GetEnvironmentVariable(keyInfo.EnvironmentVariable!);
+                if (!string.IsNullOrWhiteSpace(envValue))
+                {
+                    // 如果環境變數值有變化，更新密鑰
+                    keyInfo.EncryptedValue = Encrypt(envValue);
+                    keyInfo.LastUsedAt = DateTime.UtcNow;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 取得所有需要從環境變數同步的密鑰
+    /// </summary>
+    /// <returns>環境變數密鑰列表</returns>
+    public List<ApiKeyInfo> GetEnvironmentKeys()
+    {
+        lock (_lock)
+        {
+            return _keys.Where(k => !string.IsNullOrEmpty(k.EnvironmentVariable)).ToList();
+        }
     }
 }

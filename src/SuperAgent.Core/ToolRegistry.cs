@@ -22,6 +22,7 @@ public class ToolRegistry : IToolRegistry
     private readonly Dictionary<string, LinkedListNode<string>> _resultNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _resultsLock = new();
     private List<ToolDefinition> _toolDefinitions = new();
+    private readonly HashSet<string> _pluginTools = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// 註冊工具
@@ -30,6 +31,35 @@ public class ToolRegistry : IToolRegistry
     {
         _tools[tool.Name] = tool;
         UpdateToolDefinitions();
+    }
+
+    /// <summary>
+    /// 註冊插件工具
+    /// </summary>
+    /// <param name="tool">插件工具</param>
+    public void RegisterPluginTool(ITool tool)
+    {
+        _tools[tool.Name] = tool;
+        _pluginTools.Add(tool.Name);
+        UpdateToolDefinitions();
+    }
+
+    /// <summary>
+    /// 取得所有插件工具名稱
+    /// </summary>
+    public List<string> GetPluginToolNames()
+    {
+        return _pluginTools.ToList();
+    }
+
+    /// <summary>
+    /// 檢查工具是否為插件工具
+    /// </summary>
+    /// <param name="toolName">工具名稱</param>
+    /// <returns>是否為插件工具</returns>
+    public bool IsPluginTool(string toolName)
+    {
+        return _pluginTools.Contains(toolName);
     }
 
     public bool Unregister(string name)

@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading;
 
 var configPath = Environment.GetEnvironmentVariable("SUPERAGENT_CONFIG")
     ?? Path.Combine(AppContext.BaseDirectory, "appsettings.json");
@@ -154,6 +155,24 @@ ApplyToolConfiguration();
 LogApplicationEvent("info", "Application started", "SuperAgent");
 
 var agent = new AgentLoop(client, registry, agentConfig);
+
+// 初始化工具插件系統
+var pluginDirectory = Path.Combine(AppContext.BaseDirectory, "plugins");
+var pluginLoader = new PluginLoader(pluginDirectory);
+var pluginContext = new PluginContext(registry, client, pluginDirectory, AppContext.BaseDirectory);
+var loadedPlugins = await pluginLoader.LoadAllPluginsAsync(pluginContext, CancellationToken.None);
+
+if (loadedPlugins.Count > 0)
+{
+    WriteMarkupLine($"[bold]已載入 {loadedPlugins.Count} 個工具插件[/]");
+    foreach (var plugin in loadedPlugins)
+    {
+        registry.RegisterPluginTool(plugin);
+        WriteMarkupLine($"  - {plugin.Name} v{plugin.Version} (作者: {plugin.Author})");
+    }
+    WriteMarkupLine(string.Empty);
+}
+
 var promptHistory = new List<string>();
 var streamedIterations = new HashSet<int>();
 WriteMarkupLine("[bold]SuperAgent AI Agent CLI[/]");
